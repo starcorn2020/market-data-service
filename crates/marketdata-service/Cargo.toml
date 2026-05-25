@@ -1,0 +1,17 @@
+[package]
+name = "marketdata-service"
+version.workspace = true
+edition.workspace = true
+description = "Market data message service for the take-home assignment."
+
+[dependencies]
+# 采用 anyhow 而非原生 Box<dyn Error>：
+# - anyhow::Error 为 thin pointer（8 bytes vs 16 bytes），Result 更小、move 更便宜
+# - Hot path 零成本，性能与原生等价（甚至略快）
+# - Backtrace 懒加载，未设置 RUST_BACKTRACE 时不额外抓 trace
+# - 提供 .context()、.with_context() 等 ergonomic 工具
+# 适用于 application/service 层；library 层仍建议用 thiserror 定义具体错误 enum。
+anyhow = { workspace = true }
+
+[lints.rust]
+unused_must_use = "warn"

@@ -1,5 +1,7 @@
+# Readme 上指定用 market-data-service，根据原有代码的命名原则，采用 crates/marketdata-service
+
 [workspace]
-members = ["crates/marketdata-types", "crates/feed-sim"]
+members = ["crates/marketdata-service", "crates/marketdata-types", "crates/feed-sim"]
 resolver = "3"
 
 [workspace.package]
@@ -7,5 +9,12 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
+marketdata-service = { path = "crates/marketdata-service" }
 marketdata-types = { path = "crates/marketdata-types" }
 feed-sim = { path = "crates/feed-sim" }
+
+# 应用层错误处理：anyhow::Error 为 thin pointer（8 bytes），
+# 比原生 Box<dyn Error>（16 bytes，fat pointer）更小，
+# Result 更易被 enregistered；hot path 与原生等价甚至略胜。
+# Backtrace 默认 lazy（需 RUST_BACKTRACE=1 启用），release 环境零额外成本。
+anyhow = "1"
