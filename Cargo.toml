@@ -1,0 +1,11 @@
+[workspace]
+members = ["crates/marketdata-types", "crates/feed-sim"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+marketdata-types = { path = "crates/marketdata-types" }
+feed-sim = { path = "crates/feed-sim" }

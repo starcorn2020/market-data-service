@@ -1,0 +1,8 @@
+[package]
+name = "marketdata-types"
+version.workspace = true
+edition.workspace = true
+description = "Shared market data message types for the take-home assignment."
+
+[lints.rust]
+unused_must_use = "warn"

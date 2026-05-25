@@ -1,0 +1,15 @@
+[package]
+name = "feed-sim"
+version.workspace = true
+edition.workspace = true
+description = "Simulated upstream BookMessage source for the take-home assignment."
+
+[dependencies]
+marketdata-types = { workspace = true }
+
+[lints.rust]
+unused_must_use = "warn"
+
+[[example]]
+name = "print_messages"
+path = "examples/print_messages.rs"
