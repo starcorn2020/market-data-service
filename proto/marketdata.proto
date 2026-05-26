@@ -1,0 +1,63 @@
+// Wire schema for market-data-service.
+//
+// Two RPCs map 1:1 onto the assignment's two APIs:
+//   * GetSnapshot  -> request/response  (README #3)
+//   * Subscribe    -> server-streaming  (README #4)
+//
+// See AI_DEV_GUILDELINE.md §4.3 for the design rationale.
+
+syntax = "proto3";
+package marketdata.v1;
+
+service MarketData {
+    // Latest snapshot for a single FIGI. `NotYet` is a first-class response
+    // (README #3: "clearly-defined no data yet"), distinct from "this FIGI
+    // does not exist" — server cannot tell those apart in 3-day scope.
+    rpc GetSnapshot(GetSnapshotRequest) returns (SnapshotResponse);
+
+    // Live updates for one or more FIGIs. Server-streaming: server pushes
+    // each new BookMessage as it lands in the snapshot table. Drop semantics
+    // are visible via BookUpdate.dropped_total (see field comment).
+    rpc Subscribe(SubscribeRequest) returns (stream BookUpdate);
+}
+
+message GetSnapshotRequest {
+    string figi = 1;
+}
+
+message SnapshotResponse {
+    oneof result {
+        Book   found   = 1;
+        NotYet not_yet = 2;
+    }
+}
+
+message NotYet {}
+
+message SubscribeRequest {
+    repeated string figis = 1;
+}
+
+message BookUpdate {
+    Book book = 1;
+
+    // Server-side cumulative drop count for this subscription. The client
+    // computes lost-in-interval as (curr.dropped_total - prev.dropped_total).
+    // Cumulative (not delta) so the client auto-aligns on first message and
+    // tolerates reordering / single message loss. See GUIDELINE §4.3.3.
+    uint64 dropped_total = 2;
+}
+
+message Book {
+    string figi        = 1;
+    uint64 gateway_seq = 2;
+    int64  gateway_ts  = 3;
+    repeated Level bids = 4;
+    repeated Level asks = 5;
+}
+
+message Level {
+    double price  = 1;
+    float  qty    = 2;
+    uint32 orders = 3;
+}

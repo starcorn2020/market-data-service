@@ -3,6 +3,9 @@ name = "marketdata-service"
 version.workspace = true
 edition.workspace = true
 description = "Market data message service for the take-home assignment."
+# `cargo run -p marketdata-service` 默认跑 server 而非 client；避免 reviewer
+# 在两个 binary 之间被 cargo 询问 --bin。
+default-run = "marketdata-service"
 
 [dependencies]
 # 采用 anyhow 而非原生 Box<dyn Error>：
@@ -13,5 +16,40 @@ description = "Market data message service for the take-home assignment."
 # 适用于 application/service 层；library 层仍建议用 thiserror 定义具体错误 enum。
 anyhow = { workspace = true }
 
+# Phase 1 仅用到 tokio::sync (broadcast / mpsc / Notify) + spawn；
+# "full" 是 Phase 2 接 tonic 后才真正用满。
+tokio = { workspace = true }
+
+# Snapshot 表底层：DashMap<Figi, BookMessage>。
+dashmap = { workspace = true }
+
+# 上游 feed（GUIDELINE I3：唯一接点）。
+feed-sim = { workspace = true }
+
+# 共享型别：BookMessage / Figi 等。
+marketdata-types = { workspace = true }
+
+# Phase 2: gRPC wire 层依赖。
+tonic = { workspace = true }
+prost = { workspace = true }
+# 把 mpsc::Receiver 包成 Stream，喂给 tonic 的 server-streaming 返回值。
+tokio-stream = { workspace = true }
+
+[build-dependencies]
+# .proto -> Rust 代码生成（在 OUT_DIR；src/grpc.rs 用 tonic::include_proto! 拉回）。
+tonic-build = { workspace = true }
+# 内置 protoc 二进制，build.rs 注入 PROTOC env var；reviewer 不需手动装 protobuf-compiler。
+protoc-bin-vendored = { workspace = true }
+
 [lints.rust]
 unused_must_use = "warn"
+
+# Server entrypoint（Phase 1 起即存在）。
+[[bin]]
+name = "marketdata-service"
+path = "src/main.rs"
+
+# Phase 2 新增：sample client（README §6）。
+[[bin]]
+name = "client"
+path = "src/bin/client.rs"

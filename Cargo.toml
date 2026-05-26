@@ -13,8 +13,29 @@ marketdata-service = { path = "crates/marketdata-service" }
 marketdata-types = { path = "crates/marketdata-types" }
 feed-sim = { path = "crates/feed-sim" }
 
-# 应用层错误处理：anyhow::Error 为 thin pointer（8 bytes），
-# 比原生 Box<dyn Error>（16 bytes，fat pointer）更小，
-# Result 更易被 enregistered；hot path 与原生等价甚至略胜。
-# Backtrace 默认 lazy（需 RUST_BACKTRACE=1 启用），release 环境零额外成本。
+# 应用层错误处理：anyhow::Error 为 thin pointer（8 bytes），比原生 Box<dyn Error>
+# 更小，hot path 与原生等价甚至略胜；backtrace 默认 lazy。
 anyhow = "1"
+
+# 异步运行时：mpsc / broadcast / spawn 都依赖 tokio。"full" 在 Phase 1 暂时够用；
+# Phase 2 接 tonic 后再裁剪到具体 feature set（macros + rt-multi-thread + sync + ...）。
+tokio = { version = "1", features = ["full"] }
+
+# 并发 K-V：ingest 写多 + RPC 读少；shard-lock HashMap 命中 GUIDELINE §4.2 推荐。
+dashmap = "6"
+
+# Phase 2: gRPC 接通。
+# tonic + prost 是 Rust 生态最成熟的 gRPC 组合；server-streaming 原生支持，
+# build 期由 tonic-build 从 proto/marketdata.proto 生成代码。
+tonic = "0.12"
+prost = "0.13"
+# ReceiverStream: 把 mpsc::Receiver 直接 wrap 成 tonic 需要的 Stream。
+# "net" feature: 提供 TcpListenerStream（Phase 3 集成测试用动态端口 bind 后喂给
+# tonic::Server::serve_with_incoming）。
+tokio-stream = { version = "0.1", features = ["net"] }
+
+# Build-only：proto -> Rust 代码生成器。
+tonic-build = "0.12"
+# Vendored protoc：避免要求 reviewer 自行安装 protobuf-compiler。
+# build.rs 会把它注入 PROTOC env var，tonic-build 即可直接 spawn 这份内置 protoc。
+protoc-bin-vendored = "3"
