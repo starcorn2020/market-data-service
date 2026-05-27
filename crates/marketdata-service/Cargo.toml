@@ -3,55 +3,28 @@ name = "marketdata-service"
 version.workspace = true
 edition.workspace = true
 description = "Market data message service for the take-home assignment."
-# `cargo run -p marketdata-service` should run the server by default rather than
-# the client; this avoids cargo prompting the reviewer to pick `--bin`.
 default-run = "marketdata-service"
 
 [dependencies]
-# Error handling: the service layer uniformly uses
-# `Box<dyn Error + Send + Sync + 'static>` (aliased as `BoxError`, see `lib.rs`).
-# - 8-byte thin pointer, same size as anyhow::Error
-# - `?` automatically converts from any `Error + Send + Sync + 'static`, zero boilerplate
-# - Zero dependency (std only); the library layer defines concrete enums via thiserror
-# Capabilities given up: anyhow's lazy backtrace and `.context()` ergonomics;
-# the latter is replaced with `.map_err(|e| format!("...: {e}").into())`.
-
-# We only use tokio::sync (broadcast / mpsc / Notify) + spawn for the core
-# bus/snapshot layer; the "full" feature is fully exercised only once tonic
-# is integrated.
 tokio = { workspace = true }
-
-# Backing store for the snapshot table: DashMap<Figi, BookMessage>.
 dashmap = { workspace = true }
-
-# Upstream feed (the sole contact point with the vendor crate).
 feed-sim = { workspace = true }
-
-# Shared types: BookMessage / Figi etc.
 marketdata-types = { workspace = true }
-
-# gRPC wire-layer dependencies.
 tonic = { workspace = true }
 prost = { workspace = true }
-# Wraps mpsc::Receiver as a Stream for tonic's server-streaming return type.
 tokio-stream = { workspace = true }
 
 [build-dependencies]
-# .proto -> Rust code generation (into OUT_DIR; src/grpc.rs pulls it back in via tonic::include_proto!).
 tonic-build = { workspace = true }
-# Bundled protoc binary; build.rs injects PROTOC env var so the reviewer does
-# not need to install protobuf-compiler manually.
 protoc-bin-vendored = { workspace = true }
 
-[lints.rust]
-unused_must_use = "warn"
+[lints]
+workspace = true
 
-# Server entrypoint.
 [[bin]]
 name = "marketdata-service"
 path = "src/main.rs"
 
-# Sample client (covers the assignment's end-to-end client demo requirement).
 [[bin]]
 name = "client"
 path = "src/bin/client.rs"

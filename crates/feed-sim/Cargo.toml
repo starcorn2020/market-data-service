@@ -7,8 +7,8 @@ description = "Simulated upstream BookMessage source for the take-home assignmen
 [dependencies]
 marketdata-types = { workspace = true }
 
-[lints.rust]
-unused_must_use = "warn"
+[lints]
+workspace = true
 
 [[example]]
 name = "print_messages"
