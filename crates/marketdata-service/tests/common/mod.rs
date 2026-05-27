@@ -22,6 +22,13 @@ use marketdata_service::{
 use tonic::transport::Channel;
 
 /// 默认测试 config：listen 127.0.0.1:0、低延迟 poll、小容量便于触发边界。
+///
+/// # 容量选择(64 / 32)
+///
+/// 远小于 production default(1024 / 1024)。当前 `tests/grpc_basic.rs` 都是
+/// 低速场景(几笔 push),不会触发 capacity 边界 → 与 default 等价;**保留小容量
+/// 是为未来添加 wire-level 边界测试时不需要再换 config**(对比 §6.2 的 wire
+/// slow-consumer 走自定义大流量配置 + `#[ignore]`)。
 pub fn test_config() -> ServiceConfig {
     ServiceConfig {
         upstream: UpstreamConfig::default(), // 不会用到（MockUpstream 走 new_with_upstream）

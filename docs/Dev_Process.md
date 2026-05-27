@@ -13,8 +13,8 @@
 
 | 項目 | 狀態 |
 |---|---|
-| **Phase** | Phase 1 ✅ / Phase 2 ✅ / Phase 3 ✅ / Phase 4 ⏳ review 进行中(pass-1/2/3/4/5 ✅,下一步 pass-6 lib.rs / Service / RunningService)|
-| **最後一次 `cargo test --workspace`** | **58 passed + 1 ignored**（service 34 + feed-sim 19 + types 5；service 34 = 28 unit + 6 `grpc_basic` + 0 `grpc_slow_consumer`,後者 1 個測試 `#[ignore]`,理由見 §5.1。service unit 從 26 → 28 是 Pass-5 新增的 `put_overwrites_entire_book_not_merge` + `is_empty_reflects_population`,見 §6.8。grpc_basic 從 4 → 6 是 Pass-4 新增的 too-long-figi 双测试,見 §6.7） |
+| **Phase** | Phase 1 ✅ / Phase 2 ✅ / Phase 3 ✅ / Phase 4 ⏳ review 全 pass 完成(pass-1~7 ✅),下一步 README 撰写 + sanity check|
+| **最後一次 `cargo test --workspace`** | **60 passed + 1 ignored**(service 36 + feed-sim 19 + types 5;service 36 = 30 unit + 6 `grpc_basic` + 0 `grpc_slow_consumer`,後者 1 個測試 `#[ignore]`,理由見 §5.1。service unit 累積 26 → 30:Pass-5 +2 (`put_overwrites_entire_book_not_merge` / `is_empty_reflects_population`,§6.8)、Pass-6 +1 (`new_with_upstream_rejects_invalid_config_early`,§6.9)、Pass-7 +1 (`rejects_zero_subscriber_queue_size`,§6.10)。grpc_basic 4 → 6 是 Pass-4 新增的 too-long-figi 双测試,§6.7) |
 | **最後一次 `cargo build --release --workspace`** | 0 警告 0 錯誤 |
 | **最後一次 demo** | server: `MDS_LISTEN=0.0.0.0:50051 SIM_INSTRUMENTS=10 SIM_RATE_HZ=200 cargo run -p marketdata-service` → `[server] listening on 0.0.0.0:50051`；client: `cargo run --bin client` → `Found(seq=5921, bids=5, asks=5)` + 3s 推流 178 筆 / `dropped_total=0` |
 | **Rust toolchain** | rustc 1.95.0，edition 2024，resolver 3 |
@@ -814,6 +814,137 @@ Pass-1 / 2 / 3 / 4 都识别出至少 1 项需要改的代码或注释。Pass-5 
 **为何这样的 pass 仍有价值**:reviewer 不会读 DEV_PROCESS(那是开发过程文档);reviewer 会读 `snapshot.rs` 本身。把 §6.5 D1/D2 / D3 的拍板**搬一句进源文件**,reviewer 单文件可读时就能看到工程判断,不需要交叉跳读。这是 take-home 评分中「**密度比长度重要**」(GUIDELINE §14.4)原则的落地。
 
 **给未来自己的提醒**:不要因为「Pass-5 没改代码逻辑」就跳过本节。Review 的产出**不只是 bugfix**,更是「**让设计意图在每个文件内部独立可读**」。
+
+---
+
+### 6.9 Pass-6 收尾盘点(`lib.rs` / `Service` / `RunningService` 生命周期固化)
+
+> **产生背景**:Pass-6 review `lib.rs`(294 行)聚焦 `Service` / `RunningService` 的生命周期管理 —— `new` / `new_with_upstream` / `run` / `start` 四个入口的契约边界、`tokio::select!` 三路合流的退出语义、`Drop` 兜底机制。共识别 10 项议题(L1-L10):**1 项代码改动**(L5 早 fail-fast)+ **1 项 log 字段补齐**(L10)+ **8 项注释固化**。Future work 留 1 项(L8 production graceful shutdown 重构)。
+>
+> **本轮立场**:承袭 Pass-3/4/5 — Production 级架构改造(如 L8 的 shared shutdown channel)留作 Future work,不在 3 天 deliverable 范围。所有改动只增强**可读性 + 早 fail-fast**,不改变运行时行为(L10 仅补 log 字段,不改 ingest/serve 逻辑)。
+
+#### 议题闭环表(10 项)
+
+| 议题 | 类型 | 改动位置 | 动作 | 守的契约 |
+|---|---|---|---|---|
+| **L1** `new_with_upstream` doc 缺「立即 spawn mds-ingest std::thread」说明 | 注释 | `lib.rs::Service::new` / `new_with_upstream` doc | 把副作用顺序(validate → feed-sim spawn → ingest spawn)写清,并显式指出生命周期由 `IngestHandle::Drop` 兜底 | reviewer 单文件可读时不被 ingest 副作用 surprise |
+| **L2** `run` 路径 1(ingest EOF)不等 serve 退出,注释含糊 | 注释 | `lib.rs::Service::run` path 3 内 | 写清「demo / 测试场景 trade-off + production 改造方向(shared shutdown channel)」 + 代价(in-flight RPC 走 RST_STREAM) | 文档化 trade-off |
+| **L3** `run` 路径 2/3(serve 退出)不等 ingest_join,log 顺序乱 | 注释 | `lib.rs::Service::run` path 1+2 内 | 写清「spawn_blocking 不可 abort + closure 仍跑完 + IngestHandle::Drop 兜底」+ 修复成本(pin + 借引用) | 文档化 spawn_blocking + JoinHandle 的 cancel 语义 |
+| **L4** `Drop for RunningService` 注释只一句「runtime 关停时 cancel」 | 注释 | `lib.rs::Drop for RunningService` 内 | 改为三层保护(shutdown_tx → runtime cancel → OS process exit)+ 写清「为何仍建议显式 shutdown().await」(拿返回值 + log 顺序) | 文档化 Drop 兜底的层次 + 用户引导 |
+| **L5** `Service::new` 副作用顺序丑(feed-sim spawn → validate),无效 cfg 触发昂贵副作用 | **代码** | `lib.rs::Service::new` 顶部 | 加一行 `cfg.validate()?;` 早 fail-fast(`new_with_upstream` 内仍 validate,双重防御零成本) | fail-fast 原则 + 副作用最小化 |
+| **L6** `run` 中 `tokio::select!` 双臂 cancel-safety 未在源文件解释 | 注释 | `lib.rs::Service::run` doc 顶部 | 加 `# Cancel-safety` 段:single-shot select! 不在 loop 内 → 无传统 cancel-safety 顾虑;具体每臂 cancel 后的行为(spawn_blocking 不可 abort / tonic graceful drop) | Pass-4 G1 同款工作 |
+| **L7** `Service::start` 中 oneshot 双重保护(send + sender drop)未在源文件解释 | 注释 | `lib.rs::Service::start` shutdown channel 处 | 写清「`tx.send(())` 或 `tx` 被 drop **二者任一**都会让 `shutdown_rx.await` 完成」三层保护 | 文档化 oneshot::Receiver 语义,防止未来 refactor 误以为「不 send 会泄漏」 |
+| **L8** production 场景下 ingest EOF 应触发 serve graceful,当前架构不支持 | Future work | `lib.rs::Service::run` shutdown channel 处 | 写进 Future work 注释,**不**重构(改造需 `tokio::pin!(ingest_join)` + select! 借引用,demo / 测试场景下当前行为 OK) | 留 follow-up 入口 |
+| **L9** `Service` struct doc 缺 `run` vs `start` 对比表 | 注释 | `lib.rs::Service` struct doc | 把 DEV_PROCESS §2.0 的对比表精简版搬进源文件 | reviewer 翻 lib.rs 时就能看到两个入口的差异 |
+| **L10** `[service] ingest finished` log 字段比 `[ingest] stopped` 少 | **代码**(log) | `lib.rs::Service::run` path 3 内 | 补 `snapshot.len()` 字段,与 `[ingest] stopped: received=N snapshot.len=M gaps=K total_generated=T` 对齐 | log 一致性 + reviewer 验收锚点 |
+
+#### 测试覆盖
+
+新增 1 个 unit test:`new_with_upstream_rejects_invalid_config_early`(`lib.rs::tests`),守 L5 行为变化 —— 无效 cfg(`bus_channel_capacity=0`)必须在 `validate` 短路 reject,**不**走到 `ingest::spawn`。
+
+**为何只补 1 个 unit test**:
+- `run` / `start` 的运行时行为已由 `tests/grpc_basic.rs` 6 个 integration 测试覆盖(NotYet/Found / Subscribe 推流 / 空 figi 拒绝 / too-long figi 拒绝 ×2)。
+- 在 lib.rs 加 `run` / `start` 的 unit test 本质上需要 mock + 真实 tonic server,等于重写 integration 流程,重复成本高。
+- L5 是**新加的早 fail-fast 路径**,值得独立守护;其他 L 议题都是注释级,不构成新的行为契约。
+
+`expect_err` vs `.err().expect(...)` 的工程小坑(`Service` 不实现 `Debug`,`expect_err` 不可用)在测试代码注释里写清,防止未来有人「优化」回 `expect_err` 又触发同样的编译错误。
+
+#### Future work(L8 唯一遗留)
+
+**问题**:`Service::run` path 3(ingest EOF)目前直接 return,不等 serve graceful 退出。production 严格场景下应:
+1. 用 `tokio::sync::oneshot::channel::<()>` 作为 serve shutdown signal。
+2. shutdown signal 由 `ctrl_c` **和** `ingest EOF` 任一触发(`tokio::select! { ctrl_c, shutdown_rx }`)。
+3. path 3 fire 时 `shutdown_tx.send(())` → serve 走 graceful drain → 等 serve 真正退出 → 再 return。
+
+**为何 Pass-6 不做**:
+- 改造需要 `tokio::pin!(ingest_join)` + select! 用 `&mut ingest_join`(因为 path 3 fire 后还需要 `ingest_join` await 一次拿 stats,但 select! 把它 move 走了)。
+- 复杂度增加 30+ 行,新引入 bug 风险中等(pin / unpin / borrowing 多重交互)。
+- demo / 测试场景下当前行为 OK,reviewer 不会在 EOF 后立刻看 client 行为。
+
+写在源文件 `lib.rs::Service::run` 上方注释 + 本 §6.9 Future work 段,作为 production 部署时的明确改造入口。
+
+#### Pass-6 教训:Review 强调「**单文件可读性**」
+
+Pass-5 §6.8 末尾已经讲过这点。Pass-6 把它进一步具象化:
+
+**lib.rs 是整个 service 的「门户文件」** —— 任何看 take-home 代码的 reviewer 都会先翻这里看 `Service` 的 public API 和 lifecycle 设计。
+
+如果 reviewer 在 lib.rs 上**没看到**「为何选 oneshot 而非 broadcast / 为何 spawn_blocking 不 abort / 为何 ingest 在 new 就 spawn」这些**关键工程判断**,他必须**跨文件追代码**(`upstream/mod.rs` → `ingest.rs` → `bus.rs` → tokio 文档)才能拼出全图。**对 take-home 评分极不友好** —— reviewer 给的时间有限,追到一半放弃,印象分变成「这代码我看不懂」。
+
+**Pass-6 落地的对策**:把所有「为何这么写」的决策**搬一句进源文件**,源文件密度上升但 reviewer 单文件读完即可建立全局认知。注释行数 +80 行,代码行数 +1(L5)+ 1 行 log 字段(L10),总改动控制在「轻量但显著提升可读性」区间。
+
+**给未来自己的提醒**:每次 review 一个 module 前先问自己:「reviewer 只读这个文件能不能搞明白?」如果不能,优先补**源文件内**的注释,而不是「DEV_PROCESS 里写得很详细」。两个地方都写不冲突,但**源文件优先**。
+
+---
+
+### 6.10 Pass-7 收尾盘点(剩余模組 + 测试证据强度矩阵)
+
+> **产生背景**:Pass-7 review `config.rs` / `upstream/{mod,feed_sim,mock}.rs` / `bin/client.rs` / `tests/common/mod.rs` —— 这五个文件代码量不大,逻辑也不在 hot path,review 重点放在**测试证据强度盘点**(用户明确要求的「全 crate 视角」),为下一步写交付 README 准备「不变量测试 mapping」段直接可搬的素材。
+>
+> 共识别 9 项议题:**1 项代码改动**(P7-CL1 删除 `target.clone()`)+ **1 项测试**(P7-C1 补 `rejects_zero_subscriber_queue_size`)+ **4 项注释固化**+ **2 项 Future work**(P7-C2 from_env 全路径测试 / 跨主机自动化)+ **1 项现状正确无需动**(P7-U1 trait `Sync` bound)。
+
+#### 议题闭环表(9 项)
+
+| 议题 | 类型 | 改动位置 | 动作 |
+|---|---|---|---|
+| **P7-C1** `validate()` 第三条 check 未测(`rejects_zero_subscriber_queue_size`) | **测试** | `config.rs::tests` | 补 1 个对称覆盖,守 reviewer 翻 validate 时一目了然 |
+| **P7-C2** `from_env` 全路径(env var 解析 / MDS_LISTEN 错误 / parse_pacing 大小写)未测 | Future work | — | env var 是 process-global state,并发测试互相干扰,需 `serial_test` crate 或 refactor 抽 `parse_env` 内部逻辑。3 天 deliverable 跳过 |
+| **P7-U1** `Upstream` trait 不要求 `Sync`(`FeedSimUpstream: !Sync` / `MockUpstream: Sync`) | 现状正确 | — | 契合 GUIDELINE §3.5「整个 service 只能有一个 ingest 点」,编译期已守护,无需运行时测试 |
+| **P7-F1** `feed_sim.rs` 错误用 `{e:?}` Debug 而非 `{e}` Display | 不动 | — | BoxError 在 main 自身用 Debug print 冒泡,Debug / Display 差异不显著 |
+| **P7-M1** `mock.rs::tests` 缺导览 doc(对比 bus/snapshot/lib/grpc 风格) | 注释 | `mock.rs::tests` mod doc | 加分区表(4 测试 × 守的契约),写清「测试的测试」的特殊地位 |
+| **P7-CL1** `client.rs::target.clone()` 冗余(target 之后不再用) | **代码** | `client.rs` `MarketDataClient::connect` 调用处 | 删 `.clone()` + 加注释解释 `D: TryInto<Endpoint>` 直接接 owned `String` |
+| **P7-CL2** `client.rs` 文件 doc 缺「预期输出」段,reviewer 不知验收锚点 | 注释 | `client.rs` 顶部 mod-doc | 加完整预期 stderr + 关键观察点(`Found` / `dropped_total=0` / `received` 量级) |
+| **P7-T1** `tests/common::test_config()` 小容量(64/32)与 default 差异未说明用途 | 注释 | `tests/common/mod.rs::test_config` | 加 `# 容量选择` doc-comment 段:当前等价 default,保留小容量供未来 wire 边界测试 |
+| **P7-EM** 缺一份「测试证据强度矩阵」直接对照 README + GUIDELINE 不变量 | 文档 | 本 §6.10 | 见下方矩阵,可直接搬进交付 README §「不变量测试 mapping」段 |
+
+#### 测试证据强度矩阵(可直接搬进交付 README)
+
+> **使用方式**:写 `crates/marketdata-service/README.md` 时,把本表精简版(去掉「证据强度」「备注」两列,只留「契约 → 测试」对照)直接 copy 进「不变量测试 mapping」段。reviewer 看 README 第 4 条「slow / disconnected subscriber must not affect the others」就能 grep 出对应测试名。
+
+| 契约来源 | 守的内容 | 主要测试 | 证据强度 |
+|---|---|---|---|
+| **README §1** 消费 BookMessage | ingest 完整 drain 上游 + 不误报 gap | `ingest_drains_finite_mock_and_populates_snapshot`(ingest.rs) | 强 |
+| **README §2** per-Figi 最新快照 | 三层守护:wire / DashMap unit / N3 整份覆盖 | `snapshot_returns_latest_seq`(grpc_basic) + `put_then_get_returns_latest`(snapshot) + `put_overwrites_entire_book_not_merge`(snapshot) | 强 |
+| **README §3** "no data yet" 明确信号 | NotYet 路径两层覆盖 | `not_yet_then_found`(grpc_basic) + `get_returns_none_for_unknown_figi`(snapshot) | 强 |
+| **README §4** pub/sub + slow consumer 隔离 | 推流 happy path + I2 慢/断双覆盖 | `subscribe_streams_pushed_updates`(grpc_basic) + `slow_consumer_isolation`(bus) + `disconnected_subscriber_does_not_stall_others`(bus) | 中-强(unit 强 / wire 因环境依赖只 ignored E2E) |
+| **README §5** 同/跨主机 | 自动化只验本机 + 跨主机走手动 demo | `tests/common::test_config()` 127.0.0.1 + `bin/client.rs` 文件 doc 跨主机指令 | 弱(手动) |
+| **README §6** sample client | binary demo,无自动化测试 | `bin/client.rs` 自身;`client.rs::预期输出` doc 给 reviewer 验收锚点 | 中(手动) |
+| **I1** ingest 永不被下游阻塞 | publish 无订阅者 noop + dropped 累积证明无反压 | `publish_without_subscribers_is_noop`(bus) + `dropped_total_is_cumulative_not_delta`(bus) | 强 |
+| **I2** 慢/断订阅者隔离 | bus 层 unit deterministic 守 + wire 层 E2E ignored | `slow_consumer_isolation`(bus 慢) + `disconnected_subscriber_does_not_stall_others`(bus 断) + `slow_consumer_isolation_e2e`(grpc_slow_consumer,`#[ignore]` 手动) | 强(unit)+ ignored(wire) |
+| **I3** feed-sim 唯一接点 | 编译期 grep 验证 | `upstream/feed_sim.rs` 是整 crate 唯一 `use feed_sim::*` 的文件 | 编译期 |
+| **I4** 不洩漏 feed_sim 类型 | `ServiceConfig` 公开 API 签名无 `feed_sim::*` | 编译期(看 `lib.rs` 公开导出表) | 编译期 |
+| **GUIDELINE §4.2** gateway_seq 递增检测 | 注入 1,2,5 → gaps=1 | `gap_counter_increments_on_skipped_seq`(ingest) | 强 |
+| **GUIDELINE §4.3.3** dropped_total 累积值 | 三个观察点之间只增不减 | `dropped_total_is_cumulative_not_delta`(bus) | 强 |
+| **GUIDELINE §3.2** from-now 订阅语义 | 订阅前 publish 不补发 + 订阅后必收 | `messages_before_subscribe_are_not_replayed`(bus) | 强 |
+| **GUIDELINE §0.1.3 N3** 不做增量合并 | old 与 new BookMessage 字段不混合 | `put_overwrites_entire_book_not_merge`(snapshot) | 强 |
+| **GUIDELINE §2.1** Figi Infallible 截断 | wire 层显式拒绝过长 figi(避免静默截断 UX) | `get_snapshot_too_long_figi_rejected`(grpc_basic) + `subscribe_too_long_figi_rejected`(grpc_basic) | 强 |
+| **B3 已知 known issue** senders 表不缩 | 当前行为固化,未来 GC 时回归告警 | `senders_entry_persists_after_all_subscribers_dropped`(bus) | 强(行为锚点) |
+| **fan-in 合流** N broadcast → 1 mpsc 不漏 | 订 `[a,b]` 各推一笔 + a 再一笔 必收 3 笔 | `multi_figi_fan_in_merges_streams`(bus) | 强 |
+| **MockUpstream 自身正确性** | FIFO / wait Err / condvar 唤醒 / 累计计数 | `push_then_receive_in_fifo_order` / `wait_returns_err_after_close_and_drain` / `wait_wakes_up_on_push` / `total_generated_tracks_pushes`(mock) | 强(测试的测试) |
+| **Service config 边界** | validate() 三条 check 对称覆盖 | `default_validates` / `rejects_zero_bus_capacity` / `rejects_zero_poll_interval` / `rejects_zero_subscriber_queue_size` / `upstream_config_maps_to_subscriber_config` / `parses_pacing`(config) | 强(对称) |
+| **Pass-6 早 fail-fast** | 无效 cfg 在 `validate` 短路,不触发 ingest spawn | `new_with_upstream_rejects_invalid_config_early`(lib) | 强 |
+
+#### 测试覆盖盲区(诚实记录)
+
+> 写进交付 README 「Future work」段,展示「我知道这些没测,我也知道为什么没测」。
+
+| 盲区 | 原因 | 缓解 |
+|---|---|---|
+| `from_env` 全 env-var 路径 | env var 是 process-global state,并发测试互相干扰;`std::env::set_var` 在 Rust 2024 edition 已 `unsafe` | 内部 `parse_env<T>` helper 是泛型,可独立测试(本次未做)。Production 改造:加 `serial_test` crate 或 refactor 抽 trait |
+| 跨主机自动化(README §5) | 需要双 host / docker compose / SSH tunnel | `bin/client.rs` 文件 doc 给跨主机指令 + 预期输出 → 手动验证 |
+| wire 层 I2 stress(slow consumer) | HTTP/2 stream flow control window + adaptive window + TCP buffer 是 deployment-level tuning,不是 logic-level invariant | `slow_consumer_isolation_e2e` `#[ignore]` 保留代码 + 量化推导表(§5.1 / §6.2);I2 邏輯由 bus.rs unit 层 deterministic 守 |
+| `run` / `start` 的 select! 三路合流路径覆盖 | 需要 mock + 真实 tonic server,等于重写 integration 流程 | integration test(6 个 grpc_basic)间接覆盖 `start` + `RunningService::shutdown` 路径;`run` 路径 1(ingest EOF)由生产 binary `SIM_MAX_MESSAGES=1000` 手动跑验证 |
+| `client.rs` 错误路径 / 网络中断 | binary demo 范围,不在 crate library 责任内 | reviewer 跑 `cargo run --bin client` 手动验证;client.rs 文件 doc 列「预期输出」 |
+
+#### Pass-7 教训:**review 的最大产出是「自己整理出来的素材」**
+
+Pass-6 教训强调「源文件单文件可读性」。Pass-7 把它进一步推到 **deliverable 视角**:
+
+review 看似花了大量时间「读代码 + 写注释」,但最大的实际产出是上面那张**测试证据强度矩阵** —— 它**不能从代码自动生成**(需要人工把 README/GUIDELINE 条款与测试名做语义映射),但**直接决定交付 README 的密度与说服力**。
+
+reviewer 评 take-home 的核心问题是:「这个候选人是否真的理解自己写的东西?」。回答这个问题的最简方式不是「我的代码很优雅」而是「**我的代码用这些测试守这些不变量,不变量来自这些设计文件,我可以指着每一条**」。这张矩阵就是这个能力的具象。
+
+**给未来自己的提醒**:下次做 take-home / code review 时,把「整理出一张可直接搬进交付物的测试-契约对照表」**作为 review 的明确产出之一**,而不是「review 后顺带做」。它的工程价值往往**高于**任何单一议题的注释改动。
 
 ---
 

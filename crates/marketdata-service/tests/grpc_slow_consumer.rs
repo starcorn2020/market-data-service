@@ -79,12 +79,14 @@ use tokio_stream::StreamExt;
 /// `make_book` 的 `bid_count/ask_count` 都是 0,wire 上每笔仅 ~25 bytes;
 /// 本函数让每笔 ~480 bytes,500 笔 ≈ 240 KB → 远超 stream window 65535 bytes。
 fn full_book(figi: &str, gateway_seq: u64) -> BookMessage {
-    let mut m = BookMessage::default();
-    m.figi = figi.parse::<Figi>().expect("Figi::from_str is Infallible");
-    m.gateway_seq = gateway_seq;
-    m.gateway_ts = 1_700_000_000_000_000_000 + gateway_seq as i64;
-    m.bid_count = 10;
-    m.ask_count = 10;
+    let mut m = BookMessage {
+        figi: figi.parse::<Figi>().expect("Figi::from_str is Infallible"),
+        gateway_seq,
+        gateway_ts: 1_700_000_000_000_000_000 + gateway_seq as i64,
+        bid_count: 10,
+        ask_count: 10,
+        ..Default::default()
+    };
     for i in 0..10 {
         // 用 seq 与 level index 混合的值,避免 protobuf 把全 0 编码成 0 byte。
         // `orders` 是 u16(GUIDELINE / BookLevel 字段定义);TOTAL=500 内 mod 10000

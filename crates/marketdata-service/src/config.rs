@@ -263,15 +263,31 @@ mod tests {
 
     #[test]
     fn rejects_zero_bus_capacity() {
-        let mut cfg = ServiceConfig::default();
-        cfg.bus_channel_capacity = 0;
+        let cfg = ServiceConfig {
+            bus_channel_capacity: 0,
+            ..Default::default()
+        };
         assert!(cfg.validate().is_err());
     }
 
     #[test]
     fn rejects_zero_poll_interval() {
-        let mut cfg = ServiceConfig::default();
-        cfg.poll_interval = Duration::ZERO;
+        let cfg = ServiceConfig {
+            poll_interval: Duration::ZERO,
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    /// `validate()` 的第三条 check(subscriber_queue_size > 0)与
+    /// bus_channel_capacity / poll_interval 对称覆盖,避免「漏一个 check 没测试
+    /// 守护」的 silent gap。
+    #[test]
+    fn rejects_zero_subscriber_queue_size() {
+        let cfg = ServiceConfig {
+            subscriber_queue_size: 0,
+            ..Default::default()
+        };
         assert!(cfg.validate().is_err());
     }
 

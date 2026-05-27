@@ -255,10 +255,11 @@ mod tests {
     }
 
     fn book(seq: u64, f: Figi) -> BookMessage {
-        let mut m = BookMessage::default();
-        m.figi = f;
-        m.gateway_seq = seq;
-        m
+        BookMessage {
+            figi: f,
+            gateway_seq: seq,
+            ..Default::default()
+        }
     }
 
     // -----------------------------------------------------------------------

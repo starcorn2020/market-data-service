@@ -106,6 +106,10 @@ impl MarketData for MarketDataService {
 
     type SubscribeStream = ReceiverStream<Result<BookUpdate, Status>>;
 
+    // `tonic::Status` ~176 bytes,clippy `result_large_err` 提示 `Result<_, Status>`
+    // 偏大。这是 tonic handler 的标准错误型别;改 `Box<Status>` 会破坏 tonic 的
+    // wire 契约,且 figi parse 失败属于罕见路径,size 优化无意义。
+    #[allow(clippy::result_large_err)]
     async fn subscribe(
         &self,
         request: Request<SubscribeRequest>,
@@ -258,12 +262,14 @@ mod tests {
     }
 
     fn sample_book() -> BookMessage {
-        let mut m = BookMessage::default();
-        m.figi = figi("BBG000000123");
-        m.gateway_seq = 42;
-        m.gateway_ts = 1_700_000_000_000_000_000;
-        m.bid_count = 2;
-        m.ask_count = 1;
+        let mut m = BookMessage {
+            figi: figi("BBG000000123"),
+            gateway_seq: 42,
+            gateway_ts: 1_700_000_000_000_000_000,
+            bid_count: 2,
+            ask_count: 1,
+            ..Default::default()
+        };
         m.bids[0] = marketdata_types::BookLevel {
             price: 100.5,
             qty: 1.0,

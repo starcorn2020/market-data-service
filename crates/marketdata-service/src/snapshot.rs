@@ -107,9 +107,11 @@ mod tests {
     #[test]
     fn put_then_get_returns_latest() {
         let s = Snapshot::new();
-        let mut m = BookMessage::default();
-        m.figi = figi("BBG000000001");
-        m.gateway_seq = 1;
+        let mut m = BookMessage {
+            figi: figi("BBG000000001"),
+            gateway_seq: 1,
+            ..Default::default()
+        };
         s.put(m);
         m.gateway_seq = 42;
         s.put(m);
@@ -136,21 +138,25 @@ mod tests {
         let s = Snapshot::new();
         let f = figi("BBG000000001");
 
-        let mut old = BookMessage::default();
-        old.figi = f;
-        old.gateway_seq = 1;
-        old.bid_count = 2;
-        old.ask_count = 1;
+        let mut old = BookMessage {
+            figi: f,
+            gateway_seq: 1,
+            bid_count: 2,
+            ask_count: 1,
+            ..Default::default()
+        };
         old.bids[0] = BookLevel { price: 100.0, qty: 1.0, orders: 3 };
         old.bids[1] = BookLevel { price: 99.0, qty: 2.0, orders: 5 };
         old.asks[0] = BookLevel { price: 101.0, qty: 1.5, orders: 4 };
         s.put(old);
 
-        let mut new = BookMessage::default();
-        new.figi = f;
-        new.gateway_seq = 2;
-        new.bid_count = 1;
-        new.ask_count = 2;
+        let mut new = BookMessage {
+            figi: f,
+            gateway_seq: 2,
+            bid_count: 1,
+            ask_count: 2,
+            ..Default::default()
+        };
         new.bids[0] = BookLevel { price: 200.0, qty: 7.0, orders: 9 };
         new.asks[0] = BookLevel { price: 201.0, qty: 8.0, orders: 11 };
         new.asks[1] = BookLevel { price: 202.0, qty: 6.0, orders: 2 };
@@ -181,8 +187,10 @@ mod tests {
         assert!(s.is_empty(), "起始必为空");
         assert_eq!(s.len(), 0);
 
-        let mut m = BookMessage::default();
-        m.figi = figi("BBG000000001");
+        let m = BookMessage {
+            figi: figi("BBG000000001"),
+            ..Default::default()
+        };
         s.put(m);
 
         assert!(!s.is_empty(), "put 一笔后 is_empty 必为 false");

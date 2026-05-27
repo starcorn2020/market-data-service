@@ -166,10 +166,11 @@ impl MockHandle {
 ///
 /// `figi` 长度 > 12 字符会截断（`Figi::from_str` 的语义）。
 pub fn make_book(figi: &str, gateway_seq: u64) -> BookMessage {
-    let mut m = BookMessage::default();
-    m.figi = figi.parse().expect("Figi::from_str is Infallible");
-    m.gateway_seq = gateway_seq;
-    m
+    BookMessage {
+        figi: figi.parse().expect("Figi::from_str is Infallible"),
+        gateway_seq,
+        ..Default::default()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -178,6 +179,21 @@ pub fn make_book(figi: &str, gateway_seq: u64) -> BookMessage {
 
 #[cfg(test)]
 mod tests {
+    //! `MockUpstream` 自身正确性测试("测试的测试")。
+    //!
+    //! 守的契约(与 [`super::Upstream`] trait 的实作语义一一对应):
+    //!
+    //! | 测试 | 守的契约 |
+    //! |---|---|
+    //! | `push_then_receive_in_fifo_order` | `receive` 是 FIFO + 排空后返 `Ok(None)` |
+    //! | `wait_returns_err_after_close_and_drain` | 与 feed-sim 一致:**closed 且 queue 空**才返 `Err(())`(GUIDELINE §3.2 唯一合法结束信号) |
+    //! | `wait_wakes_up_on_push` | condvar 唤醒生效:push 后 ≤200ms 内唤醒,**不是** poll-sleep 假冒 |
+    //! | `total_generated_tracks_pushes` | 累计计数等于 push 次数(对应 `Upstream::total_generated`) |
+    //!
+    //! 这四条共同保证:Phase 3 / Pass-X 用 MockUpstream 注入的整合测试,**底层
+    //! mock 行为本身**与 feed-sim 黑盒上游语义一致 —— 若 mock 自己就违反契约,
+    //! 任何上层测试通过都没意义。
+
     use super::*;
     use std::thread;
     use std::time::Instant;

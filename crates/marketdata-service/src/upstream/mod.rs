@@ -44,6 +44,11 @@ pub trait Upstream: Send {
     fn receive(&self) -> Result<Option<BookMessage>, BoxError>;
 
     /// 阻塞 `duration` 后返回；`Err(())` = 上游已排空且关闭 = 唯一合法的结束信号。
+    //
+    // `Result<(), ()>` 对齐 `feed_sim::FeedSubscriber::wait` 写死的契约 ——
+    // `Err(())` 是 feed-sim 的唯一合法结束讯号(无 error variant 区分),改 custom
+    // error type 会破坏 I3(feed-sim 边界对应)。clippy `result_unit_err` 此处忽略。
+    #[allow(clippy::result_unit_err)]
     fn wait(&self, duration: Duration) -> Result<(), ()>;
 
     /// 累计生成 / 入 buffer 的数量（供 sanity check）。
