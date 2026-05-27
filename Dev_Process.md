@@ -14,7 +14,7 @@
 | 項目 | 狀態 |
 |---|---|
 | **Phase** | Phase 1 ✅ / Phase 2 ✅ / Phase 3 ✅ / Phase 4 ⏳ 待開始 |
-| **最後一次 `cargo test --workspace`** | 預期 55/55 全綠 + 1 ignored（service 31 + feed-sim 19 + types 5；`slow_consumer_isolation_e2e` 改 `#[ignore]`，理由見 §5.1） |
+| **最後一次 `cargo test --workspace`** | 預期 **54 passed + 1 ignored**（service 30 + feed-sim 19 + types 5；service 30 = 26 unit + 4 `grpc_basic` + 0 `grpc_slow_consumer`,後者 1 個測試 `#[ignore]`,理由見 §5.1） |
 | **最後一次 `cargo build --release --workspace`** | 0 警告 0 錯誤 |
 | **最後一次 demo** | server: `MDS_LISTEN=0.0.0.0:50051 SIM_INSTRUMENTS=10 SIM_RATE_HZ=200 cargo run -p marketdata-service` → `[server] listening on 0.0.0.0:50051`；client: `cargo run --bin client` → `Found(seq=5921, bids=5, asks=5)` + 3s 推流 178 筆 / `dropped_total=0` |
 | **Rust toolchain** | rustc 1.95.0，edition 2024，resolver 3 |
@@ -410,6 +410,41 @@ GUIDELINE §10 對照表：reviewer 看 README 第 4 條「slow / disconnected s
   - **過程**：先以為是壓力參數不足,加大 TOTAL=100→500 + stall 800→1500ms 無效;再發現 `make_book` 構造空殼 book(wire size ~25 bytes),引入 `full_book`(wire ~480 bytes)後在嚴格 HTTP/2 window 實現上理論能爆,但 macOS M-series 上 TCP / adaptive window 仍可能放大有效窗口,**測試本質依賴環境**。
   - **結論**：I2 是**邏輯不變量**,該由 deterministic unit 測試守(已由 bus.rs `slow_consumer_isolation` + `disconnected_subscriber_does_not_stall_others` 完成);wire 壓力是**部署級 tuning**,該由 environment-controlled benchmark 跑,不該擋 CI baseline。
   - **保留價值**：① 檔頭的 buffer 4 層表 + wire size 影響表是交付素材;② 手動跨主機 / Linux 驗證 wire 容量假設仍是實用工具;③ reviewer 按「slow consumer」搜尋仍命中。手動跑指令見測試檔頭與 §5.1。
+- [x] **B1 race window 註解修補**（Phase 4 review pass-2 收尾,純註解修正,代碼邏輯零變動）：
+
+  **議題起源**：`Bus::publish` L61 原註解寫「`SendError` 唯一可能原因:所有 receiver 同时 drop」——「**唯一**」不準確,實際還有第二條 0-receivers 路徑。下一個讀代碼的人會被誤導,以為這分支只在「全員退訂」時走到。
+
+  **時間軸**（`subscribe()` 內單 FIGI iteration）：
+
+  | T  | 動作 | senders 狀態 | receiver_count |
+  |----|---|---|---|
+  | T0 | (訂閱開始前) | 無 entry | 0 |
+  | T1 | `entry().or_insert_with(...)` 完成 + `clone()`,**shard lock 釋放** | 有 entry | **0** |
+  | T2 | `sender.subscribe()` 返回 `bc_rx` | 有 entry | 1 |
+  | T3 | `tokio::spawn(fan_in_one(...))` 排入 scheduler | 同 T2 | 1 |
+  | T4 | task 真正被 poll → `bc_rx.recv().await` | 同 T2 | 1 |
+
+  **T1 → T2 寬度 ≈ 一次 Arc::clone + 一次方法返回,奈秒級**。
+
+  **並發 publish 在四個時刻的命運**：
+
+  | publish 時刻 | `senders.get()` | `tx.send()` | 訊息 |
+  |---|---|---|---|
+  | T < T1 | `None` | 不執行 | 丟（C3 守的「from-now 之前」邏輯邊界）|
+  | **T1 → T2** | `Some(tx)` | **`SendError` (0 receivers)** | **丟** ← B1 race window |
+  | T2 → T4 | `Some(tx)` | `Ok(1)` 寫入 ring buffer | 留在 ring,T4 後 `recv()` 拿到 ✓ |
+  | T > T4 | `Some(tx)` | `Ok(1)` | 正常 fan-in ✓ |
+
+  **Benign 評估**（為何選擇不修代碼）：
+  - **單執行緒語意正確**:`bus.subscribe(...)` 返回後再 publish,Receiver 必已就位(T2 在 spawn 之前**同步**執行,subscribe 返回前 `receiver_count ≥ 1`)。caller 視角下無 race。
+  - **並發場景丟失極小**:真實負載 1000 msg/s 下,每次訂閱 race window 內平均丟 0–1 筆;ingest 啟動先於訂閱時,通常為 0。
+  - **語意邊界內**:丟的這筆屬於「from-now 切點附近」,C3 測試守的是「完全沒訂閱者時 publish」的邏輯邊界,並沒承諾精確到 ns 切點。
+  - **快照表補位**:client 標準用法是先 `GetSnapshot(figi)` 再 `Subscribe(...)`;ingest 是「先 put snapshot 後 publish」(GUIDELINE 順序不變量),race window 丟掉的這筆內容已在 snapshot 表內。client **不會「真的丟資料」**。
+  - **修復成本高**:要把 entry 創建 + receiver 註冊變單個原子操作,要不就持 shard write lock 跨 `sender.subscribe()`(影響 publish hot path 的 DashMap shard 設計),要不重設計成「register 與 broadcast 解耦 + epoch 機制」。三天 deliverable 不值。
+
+  **為何不寫專屬測試固化**:可靠觸發 race 需要多執行緒併發 subscribe + publish 的 stress test,與 `slow_consumer_isolation_e2e` 同類屬「環境依賴的壓力測試」,非 deterministic 不變量測試。本次刻意不做。
+
+  **動作**:只改 `bus.rs::publish` L61 註解,改為列出兩條 0-receivers 路徑 + benign 標註 + 修復成本說明。代碼邏輯零變動,測試清單零變動(逐條對照 9 個 bus 測試,無一是針對訂閱進行中的 race window;C3 名稱相似但守的是 T < T1 區段的完全無訂閱者場景,屬 deterministic 邏輯邊界,**不能**忽略)。
 - [ ] `clippy --workspace --all-targets -- -D warnings` 跑一遍，照 GUIDELINE §6 修任何剩餘 warning。
 - [ ] `crates/feed-sim/src/Congfig.md` → `Config.md`（typo）；同步更新 `AI_DEV_GUILDELINE.md` §1 / §3 引用（feed-sim 是只讀 crate，這裡只動文件名與引用，不動 logic）。
 - [ ] 考慮是否加 `tracing`（D7 重新評估點）。若加，**只在 main.rs init**，library 內部仍用 `tracing::info!` macros（switch cost 極低）。當前所有 log 走 `eprintln!`，足以 demo。
@@ -418,7 +453,7 @@ GUIDELINE §10 對照表：reviewer 看 README 第 4 條「slow / disconnected s
 ### 6.3 最終 sanity check
 
 - [ ] `cargo build --release --workspace` 零警告。
-- [ ] `cargo test --workspace` 預期 **55 passed + 1 ignored**（Phase 3 的 51 + Phase 4 review pass-2 補 4 個 bus.rs 測試 C1–C4；E2E 壓力測試 `slow_consumer_isolation_e2e` 標 `#[ignore]`，理由見 §5.1）。
+- [ ] `cargo test --workspace` 預期 **54 passed + 1 ignored**（Phase 3 的 51 − 1（`slow_consumer_isolation_e2e` 改 `#[ignore]` 從 passed 移到 ignored 欄）+ Phase 4 review pass-2 補 4 個 bus.rs 測試 C1–C4 = 54；ignored 欄 +1 即為 e2e 測試本身,理由見 §5.1）。
 - [ ] **可選**：手動跑 `cargo test -p marketdata-service --test grpc_slow_consumer -- --ignored`,驗證 wire 壓力在當前環境下的行為(observability,不是 pass/fail)。
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings`。
 - [ ] zip 排除 `target/` / `.git/`。

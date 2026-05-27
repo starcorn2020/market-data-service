@@ -52,13 +52,23 @@ impl Bus {
     }
 
     /// **Ingest hot path**。无订阅者时静默丢弃（无 entry → noop；有 entry 但
-    /// 0 receivers → `SendError` 忽略）。
+    /// 0 receivers → `SendError` 忽略,见下面 publish 内注释列出的两条 0-receivers
+    /// 路径）。
     ///
     /// 永不阻塞、永不分配（DashMap shard read lock 是极轻的 RwLock）。
     #[inline]
     pub fn publish(&self, book: BookMessage) {
         if let Some(tx) = self.senders.get(&book.figi) {
-            // SendError 唯一可能原因：所有 receiver 同时 drop。忽略。
+            // SendError 在两种情况发生,均忽略:
+            //   ① 所有 receiver 同时 drop —— 订阅者退订后下一笔 publish 走到这里;
+            //   ② B1 race window:subscribe 进行中,entry 已 insert 但
+            //      `sender.subscribe()` 尚未执行的 ns 级窗口。Benign:
+            //      - 窗口宽度 ~ 一次 Arc clone,真实负载下平均丢 0-1 笔;
+            //      - 丢的这笔属"from-now 切点"语义边界,C3 测试没承诺精确切点;
+            //      - client 标准用法是先 GetSnapshot 后 Subscribe,丢的内容已在
+            //        snapshot 表(GUIDELINE「先 put 后 publish」顺序不变量);
+            //      - 修此 race 需让 entry 创建 + receiver 注册成单个原子操作,
+            //        会影响 publish hot path 的 DashMap shard 设计,不值得。
             let _ = tx.send(book);
         }
     }
