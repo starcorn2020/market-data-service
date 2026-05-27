@@ -134,3 +134,57 @@ async fn subscribe_empty_figis_rejected() -> Result<(), BoxError> {
     running.shutdown().await?;
     Ok(())
 }
+
+/// 守 grpc.rs `get_snapshot` 的显式长度校验:Figi::from_str 本身是 Infallible
+/// (GUIDELINE §2.1 silently 截断),wire 层在 parse 前主动拒绝过长 figi,避免
+/// 客户端送 "BBG_LONG_FIGI" 被切成前 12 byte 后大概率返 NotYet 的诡异 UX。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn get_snapshot_too_long_figi_rejected() -> Result<(), BoxError> {
+    let (running, mock) = common::spawn_default_service().await?;
+    let mut client = common::make_client(running.addr()).await?;
+
+    let err = client
+        .get_snapshot(GetSnapshotRequest {
+            figi: "BBG_TOO_LONG_FIGI_13PLUS".into(), // 24 bytes > 12
+        })
+        .await
+        .expect_err("过长 figi 必拒");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message().contains("too long"),
+        "error message 应明确说「too long」,实际 {:?}",
+        err.message()
+    );
+
+    mock.close();
+    running.shutdown().await?;
+    Ok(())
+}
+
+/// 同上,守 `subscribe` 路径上的 figi 长度校验。任一条过长即整个 subscribe 拒绝
+/// (all-or-nothing 语义)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subscribe_too_long_figi_rejected() -> Result<(), BoxError> {
+    let (running, mock) = common::spawn_default_service().await?;
+    let mut client = common::make_client(running.addr()).await?;
+
+    let err = client
+        .subscribe(SubscribeRequest {
+            figis: vec![
+                "BBG000000001".into(), // 合法 12 byte
+                "BBG_TOO_LONG_FIGI_13PLUS".into(), // 24 bytes,触发拒绝
+            ],
+        })
+        .await
+        .expect_err("含过长 figi 的 subscribe 必拒");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message().contains("too long"),
+        "error message 应明确说「too long」,实际 {:?}",
+        err.message()
+    );
+
+    mock.close();
+    running.shutdown().await?;
+    Ok(())
+}

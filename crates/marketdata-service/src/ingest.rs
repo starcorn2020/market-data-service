@@ -33,7 +33,10 @@ pub struct IngestHandle {
 pub struct IngestStats {
     /// 实际成功收到 / 写入 snapshot / 广播的笔数。
     pub received: u64,
-    /// `gateway_seq` 不连续的次数（GUIDELINE §4.2 gap 偵测）。
+    /// `gateway_seq` 不连续的**事件次数**(每次跳跃 = +1,无论跳几笔)。
+    ///
+    /// 粒度选择 `event count` 是 GUIDELINE §4.2 拍板的(「紀錄一筆 gap event」)。
+    /// 「漏了几笔」「閾值」「復原」属 GUIDELINE §13 TODO,不在 deliverable 范围。
     pub gaps: u64,
 }
 
@@ -135,6 +138,8 @@ fn ingest_loop<U: Upstream>(
                 Ok(Some(book)) => {
                     stats.received += 1;
 
+                    // 考虑过乱序情况，在feed-sim的情况下不会产生错误
+                    // 未来在实际情况下可能会需要调整
                     if let Some(prev) = last_seq
                         && book.gateway_seq != prev + 1
                     {

@@ -13,8 +13,8 @@
 
 | 項目 | 狀態 |
 |---|---|
-| **Phase** | Phase 1 ✅ / Phase 2 ✅ / Phase 3 ✅ / Phase 4 ⏳ 待開始 |
-| **最後一次 `cargo test --workspace`** | 預期 **54 passed + 1 ignored**（service 30 + feed-sim 19 + types 5；service 30 = 26 unit + 4 `grpc_basic` + 0 `grpc_slow_consumer`,後者 1 個測試 `#[ignore]`,理由見 §5.1） |
+| **Phase** | Phase 1 ✅ / Phase 2 ✅ / Phase 3 ✅ / Phase 4 ⏳ review 进行中(pass-1/2/3/4/5 ✅,下一步 pass-6 lib.rs / Service / RunningService)|
+| **最後一次 `cargo test --workspace`** | **58 passed + 1 ignored**（service 34 + feed-sim 19 + types 5；service 34 = 28 unit + 6 `grpc_basic` + 0 `grpc_slow_consumer`,後者 1 個測試 `#[ignore]`,理由見 §5.1。service unit 從 26 → 28 是 Pass-5 新增的 `put_overwrites_entire_book_not_merge` + `is_empty_reflects_population`,見 §6.8。grpc_basic 從 4 → 6 是 Pass-4 新增的 too-long-figi 双测试,見 §6.7） |
 | **最後一次 `cargo build --release --workspace`** | 0 警告 0 錯誤 |
 | **最後一次 demo** | server: `MDS_LISTEN=0.0.0.0:50051 SIM_INSTRUMENTS=10 SIM_RATE_HZ=200 cargo run -p marketdata-service` → `[server] listening on 0.0.0.0:50051`；client: `cargo run --bin client` → `Found(seq=5921, bids=5, asks=5)` + 3s 推流 178 筆 / `dropped_total=0` |
 | **Rust toolchain** | rustc 1.95.0，edition 2024，resolver 3 |
@@ -532,7 +532,288 @@ GUIDELINE §10 對照表：reviewer 看 README 第 4 條「slow / disconnected s
 | slow_consumer_isolation (slow) | 30 | 11 | 19 | 11+19=30 ✓ |
 | dropped_total_is_cumulative_not_delta | 200 | 3 | 197 | 3+197=200 ✓ |
 
-**沒有訊息神秘消失** —— I2「`dropped_total` 涵蓋任何原因沒送達」承諾在 wire log 層級得到驗證。這條可寫進交付 README「不變量測試 mapping」段，作為 I2 的「實證」一行。
+**沒有訊息神秘消失** —— I2「`dropped_total` 涵蓋任何原因沒送達」承諾在 wire log 層級得到驗證。這條可寫進交付 README「不變量測試 mapping」段,作為 I2 的「實證」一行。
+
+---
+
+### 6.5 Phase 4 review pass-3 設計取捨筆記(交付素材池)
+
+> **產生背景**:review `ingest.rs` 時和開發者討論到「為什麼 snapshot 跟 bus 要分開兩個結構,不能合成一個緩存?」「為什麼用 `Arc<Snapshot>`,鎖不會拖延遲嗎?」過程中釐清了三個容易混淆的概念,整理成寫交付 README §「設計決策」/「Future work」可直接引用的素材。
+
+#### D1. Snapshot 與 Bus 為什麼分開兩個結構(不能合成單一緩存)
+
+**起因**:直覺上「ingest 寫一處,訂閱者跟 R/R 都從同一處讀」聽起來更乾淨、寫一次就好。實際分析後**反而更糟**。
+
+**核心觀念**:「兩處寫」的本質是**兩個邏輯需求**,不是兩個資料結構造成的。
+
+| 邏輯需求 | 對應寫操作 |
+|---|---|
+| 保存「最新值」(R/R `GetSnapshot` 用) | **覆寫**某個位置(舊值丟掉) |
+| 廣播給每個訂閱者(Pub/Sub `Subscribe` 用) | **添加**到 ring buffer(舊值保留到 buffer 滿) |
+
+這是**兩個不同語意**的寫操作。不管包裝成幾個資料結構,**這兩個寫操作都必須各做一次**。
+
+**合併方案的四個變體 + 失敗點**:
+
+| 變體 | 設計 | 失敗原因 |
+|---|---|---|
+| X1 訂閱者輪詢 HashMap | stream handler 每 N ms 拉 HashMap | 漏訊息(N ms 內多筆更新只看到最後一筆),違反 README §4「as they arrive」;延遲變成 ms 級 |
+| X2 HashMap + 通知信號(`watch::Sender`) | ingest 寫 HashMap 後發 signal,訂閱者拉 | 訂閱者醒來前若再來一筆,先前那筆已被覆蓋 → 仍漏訊息 |
+| X3 `HashMap<Figi, Vec<BookMessage>>`(歷史 buffer)| 每 figi 一個 Vec,訂閱者持 cursor | Vec push/讀要 Mutex,hot path 拿 write lock → 違反 I1;最終等於 broadcast channel 的手工再實作,更慢更難寫 |
+| X4 合進同一個 struct | `DashMap<Figi, (BookMessage, broadcast::Sender)>` + `entry().and_modify()` | (1) `entry()` 拿 shard write lock,範圍變大(2) R/R `get_latest` 被 ingest write lock 阻塞 → 違反 I1 在讀路徑的延伸(3) broadcast::Sender 本來 lock-free,被外層 RwLock 包住,失去 lock-free 優勢 |
+
+**現有設計的勝出之處(寫進交付 README)**:
+
+snapshot / bus 拆兩個 DashMap **不是疏漏,是有意的微觀架構**:
+
+- `snapshot.put` 拿 shard **write** lock(短)
+- `bus.publish` 拿 shard **read** lock(更短)+ lock-free `broadcast::send`
+- 兩個 shard lock **方向不同**,讀寫不互相阻塞
+- R/R 讀 snapshot 用 read lock,跟 ingest 的 snapshot write 短暫互斥(μs 級),跟 bus.publish 完全並行
+
+合進一個 struct → 全部走 write lock → ingest 越忙 R/R 越慢。
+
+**量化**(每筆訊息 hot path):
+
+| 操作 | 估計 |
+|---|---|
+| `Arc::deref()` × 2 (snapshot + bus) | ≈ 0 ns(純指標解引用) |
+| `DashMap::insert`(snapshot.put 內部) | ~50-200 ns |
+| `DashMap::get`(bus.publish 內部) | ~20-100 ns |
+| `broadcast::Sender::send`(無 receiver) | ~50 ns |
+| `broadcast::Sender::send`(有 receiver,寫 ring + 喚醒) | ~200-500 ns |
+| **合計** | **~300 ns - 1 µs** |
+
+在 1k msg/s 預設速率下占 < 0.1% 時間;50k msg/s 上限下也只占 5%。**不是延遲瓶頸**。
+
+#### D2. `Arc<Snapshot>` / `Arc<Bus>` 跟「鎖」是兩回事
+
+**起因**:直覺以為 `Arc` 是某種鎖,擔心「Arc clone / lock 會拖延遲」。實際上 **`Arc` 完全不是鎖**,概念混淆需要釘死。
+
+**對照表**:
+
+| | `Arc<T>` | `Mutex<T>` / `RwLock<T>` |
+|---|---|---|
+| 本質 | **引用計數**(Atomic Reference Count) | **互斥鎖** |
+| 阻塞語意 | **永不阻塞** | 拿不到鎖會阻塞 |
+| Hot path 成本 | `deref()` 是純 pointer dereference,**零成本** | `lock()` 無爭用時 ~ 20 ns,有爭用時可任意長 |
+| `clone()` 成本 | 一次 `fetch_add(1, Relaxed)` ~ 5-10 ns | 不適用 |
+| 解決什麼問題 | 跨 thread 共享**所有權** | 跨 thread 共享**可變存取** |
+
+**`ingest_loop` 上 Arc 真實使用幾次**:
+
+```rust
+fn ingest_loop<U: Upstream>(
+    upstream: U,
+    snapshot: Arc<Snapshot>,    // 進入 thread 時 move 進來,持有 owned Arc
+    bus: Arc<Bus>,              // 同
+    ...
+) -> IngestStats {
+    loop {
+        // 整個 loop 期間 不 clone Arc,Hot path 零 Arc 開銷
+        snapshot.put(book);   // Arc::deref → &Snapshot(零成本)→ DashMap::insert
+        bus.publish(book);    // Arc::deref → &Bus(零成本)→ DashMap::get + broadcast::send
+    }
+}
+```
+
+**真正的鎖在哪**:在 `DashMap` 內部 shard 上的 `RwLock`。但 DashMap 把 map 切成 N 個 shard(預設 16-64),每個 shard 自己一把 lock,**只鎖該 FIGI 所在的那個 shard**,其他 shard 並行寫讀無妨。
+
+**寫進交付 README**:
+
+> The service uses `Arc<DashMap<...>>` rather than `Arc<RwLock<HashMap<...>>>` not just for simplicity but because hot-path reads and writes are mostly to different shards — the explicit `RwLock` would serialize all accesses, while DashMap's per-shard locks keep distinct FIGIs independent. The `Arc` itself is a reference-counted shared pointer with no locking semantics; its hot-path cost is a single pointer dereference.
+
+#### D3. 「方法級 vs 約束級」優化框架
+
+**起因**:開發者注意到「不管怎麼改方法都不會更好」,問是否還有改進空間。這是個成熟工程師的觀察,值得提煉成框架。
+
+**兩層區分**:
+
+| 層次 | 問題 | 本專案的狀態 |
+|---|---|---|
+| **方法級**(在固定約束下選最好的解) | 「snapshot + bus 兩個結構 vs 合成一個」「`DashMap` vs `RwLock<HashMap>`」 | **已摳到底**,D1 / D2 推導,任何改動都更差 |
+| **約束級**(改變題目給的限制) | 「為什麼上游一定是 mpsc?」「為什麼 wire 一定是 gRPC over TCP?」 | **還有空間**,但要跨越 README 邊界 |
+
+**真正能進一步降延遲的方向(都屬於約束級,本次刻意不做)**:
+
+| # | 方向 | 估計改善 | 為什麼這次不做 |
+|---|---|---|---|
+| 1 | 換 `feed-sim` 為 iceoryx2(共享記憶體) | ingest 入口 μs → ns 級 | **N1 non-goal**:transport hidden;`Upstream` trait 已為此鋪路(I4),未來只動 `upstream/feed_sim.rs` |
+| 2 | 同主機改 Unix Domain Socket / SHM 取代 gRPC over TCP | localhost roundtrip 100s μs → < 10 μs | **README §5** 要求同/跨主機**同一個 wire**;放寬可雙協議,但矛盾 design doc |
+| 3 | 批次廣播(每 N 筆 publish 一次) | broadcast send 從 N 次 → 1 次,throughput 3-5x | 違反 §4「as they arrive」逐筆語意 |
+| 4 | PGO / LTO 編譯優化 | hot path -5% ~ -10% | 三天 deliverable 沒時間建 PGO corpus |
+| 5 | CPU pinning + isolated cores | p99 抖動明顯改善 | **部署層**,跟代碼無關 |
+| 6 | `DashMap` 預先 reserve(避免 rehash) | 初始化期可預測 | 邊際收益,初始化不在 hot path |
+| 7 | `arc-swap` 取代 DashMap 的 latest 視圖 | snapshot.get 完全 lock-free | 多依賴 + 收益 < 100 ns;對「N 個 figi 各自一份」沒比 DashMap 強多少 |
+
+**寫進交付 README §「Future work」**:
+
+> The current `Arc<DashMap> + tokio::broadcast` design is the cheapest valid choice **under the constraints README imposes**(single uniform wire protocol, generic `BookMessage` source as opaque mpsc, latest-value-and-stream dual API).
+>
+> Further latency improvement requires relaxing one of those constraints:
+> 1. Swap `feed-sim`(opaque mpsc, ~μs floor) for iceoryx2 SHM(ns floor)— the `Upstream` trait was designed exactly to make this a one-file change.
+> 2. Add a separate Unix Domain Socket / SHM path for local clients on top of gRPC for remote clients — gives ~10x localhost roundtrip but doubles the wire surface and contradicts the "same wire" decision.
+> 3. Batched broadcast — improves throughput by ~3-5x at the cost of "as-they-arrive" semantics in README §4.
+>
+> None of these are within the 3-day deliverable scope. The `Upstream` trait abstraction makes (1) a clean follow-up.
+
+**收益**:這段話傳達的訊號是「**我知道極限在哪、我知道怎麼突破、我選擇不突破因為題目沒要求**」,reviewer 評分時這比真的做 PGO 還值錢——展示的是**工程判斷力**,不是**埋頭優化**。
+
+---
+
+### 6.6 Pass-3 收尾盘点(议题逐项关闭 + near-miss 复盘)
+
+> **产生背景**:Pass-3 review `ingest.rs` 期间识别出三个待处理议题(Q1' / Q2 / Q9),按「对照 GUIDELINE 立场决定动作」原则逐项关闭。**全部结论:不改逻辑,只动注释**——理由见下表。
+
+#### 议题闭环表
+
+| 议题 | 焦点 | GUIDELINE 立场 | 关闭动作 | 改动位置 |
+|---|---|---|---|---|
+| **Q1'** | `gateway_seq != prev + 1` 对乱序/重复脆弱 | §4.2 明文写 `!= prev + 1` + 「不要 panic」 | 保留 `!=`,加 2 行说明「想过 OOO + feed-sim 范围内零影响 + 未来需调整」 | `ingest.rs` L141-142 |
+| **Q2** | gap 粒度(event count vs missing count)| §4.2 写「**紀錄一筆 gap event**」(event count);§13 把閾值/上報/復原列 TODO | 保留 event count,扩充 `IngestStats::gaps` doc-comment 引用 GUIDELINE 出处 | `ingest.rs` L36-40 |
+| **Q9** | `Upstream::receive() Err` 路径 | §6 / §11 反模式:不 unwrap、要 log、不殺服務 | **完全不动**,现状代码已全部满足 guideline 底线;未来若接 iceoryx2 真出 Err,看到 log 再加 counter 也来得及 | 0 |
+
+#### 关闭原则:对照 GUIDELINE 拍板,不擅自擴大 scope
+
+Q1' / Q2 在 GUIDELINE §4.2 都已明确表态,**没有讨论空间**:
+
+- Q1' 的 `!=` 是 GUIDELINE 选定的运算符;改 `>` 是擅自变更口径。
+- Q2 的「一筆 gap event」是 GUIDELINE 选定的粒度;改 missing count 是擅自变更口径。
+- 加 counter / 拆字段 / 节流(Q9 / Q2 的 over-engineering 提议)属 §13 TODO 范围,3 天 deliverable 不做。
+
+**Pass-3 教训**:reviewer 友好 = **GUIDELINE 一致 + 注释说清「为何选这个」**,而不是「我比 GUIDELINE 想得更多」。后者在 take-home 评分语境下反而扣分(显得没读题或不尊重设计文件)。
+
+#### 复盘:一次复制粘贴 near-miss(deterministic 测试的实证价值)
+
+补 Q1' 注释时,gap-check 代码块**被意外复制一份**(完整的 `if let Some(prev) = last_seq && ... { stats.gaps += 1; } last_seq = Some(...)` 出现两次)。第二份在 `last_seq` **已被设成当前 seq** 之后再判断 `curr != prev + 1` → `curr != curr + 1` → **永远 true** → 每笔都 +1。
+
+**测试反应**:`cargo test --workspace` 立刻 2 个 fail:
+
+| 测试 | 期望 | 实际 |
+|---|---|---|
+| `gap_counter_increments_on_skipped_seq` | gaps=1 (push 1,2,5) | gaps=4 (received=3) |
+| `ingest_drains_finite_mock_and_populates_snapshot` | gaps=0 (push 1..=30) | gaps=30 (received=30) |
+
+**关键观察**:
+
+- deterministic unit 测试**第一时间 catch 到逻辑回归**;stderr 报具体数字(`gaps=4 / 30`),定位成本接近零,从「测试 fail」到「找到重复块」< 30 秒。
+- 这印证了 **pass-2 把 `grpc_slow_consumer_isolation_e2e` 改 `#[ignore]` 是对的**:如果那个测试因环境抖动 flaky,**真的逻辑回归会被 flake 噪声掩盖**。
+- 也印证了 **pass-3 立场「I2 / 不变量由 deterministic unit 测试守、不靠环境压力测试」**得到具体实证 —— 一次低级粘贴错误被秒级抓出。
+
+**修复**:删除重复块,`cargo test --workspace` 立刻回 54 passed + 1 ignored,与 §0 baseline 完全一致。
+
+**给未来自己的提醒**:**任何注释/重构操作后必跑 `cargo test --workspace`**(即使「只是改注释」也可能误剪/误贴代码)。pass-2 / pass-3 修注释多次没出问题是运气,本次是必然。
+
+---
+
+### 6.7 Pass-4 收尾盘点(`grpc.rs` 五项议题闭环 + 行为变化清单)
+
+> **产生背景**:Pass-4 review `grpc.rs` 期间识别出 5 项议题(wire-pump cancel handle / dropped sample race / drop(out_tx) 语义 / Status 类型注入路径 / Figi parse 的 dead code)。与 Pass-3 全是「注释级闭环」不同,本轮**两项触及代码**(wire-pump 重构 + Figi 长度校验),另**两个新测试**进入 baseline。三项纯注释固化设计取舍。
+>
+> **本轮立场**:严格遵守「只做功能性测试,不做效能测试实践」(承袭 Pass-2 对 e2e slow consumer 的处置)。所有改动都是**邏輯級不变量**(I1/I2/I3/I4)的守护增强,不是压力 tuning。
+
+#### 议题闭环表(5 项)
+
+| 议题 | 类型 | 改动位置 | 动作 | 守的不变量 |
+|---|---|---|---|---|
+| **G1** wire-pump task 无 cancel handle | **代码** | `grpc.rs` 原 L130-151 → 现 L156-199 | `while let` → `tokio::select!` 双臂(`sub.next()` + `out_tx.closed()`)+ 4 层註释固化语义 | I1 / I2(task 不洩漏即不长期占用 fan-in task slot) |
+| **G2** `dropped.load(Relaxed)` 与 N 个 fan-in `fetch_add` 的 sample race | 注释 | 同 G1 select! 主臂内 L163-167 | 固化「累積值 benign race」:漏掉的会在下一笔 BookUpdate 出现,最终累積值正确(GUIDELINE §4.3.3 累積值语义) | 守 §4.3.3 累積值语义 |
+| **G3** `drop(out_tx)` 冗餘 vs 必要 | 注释 | 同 G1 task 结尾 L186-198 | 讲清三条退出路径各自的 drop 语义(副臂 closed / 主臂 try_send Closed / 主臂 None → out_tx 仍 open 必须 drop) | 守「client 看到 stream end 而非 hang」 |
+| **G4** `Result<BookUpdate, Status>` 中 `Status` 类型注入路径未使用 | 注释 | 同 G1 task 结尾 L192-197 | 解释 tonic 约定 + 未来主动断流(`Status::Cancelled`)的注入点 | 文档化未来 graceful shutdown 的注入点 |
+| **G5a** Figi parse `.map_err` 是 dead code | **代码** | `grpc.rs` L83-95 / L113-133 | `Figi::from_str` 是 Infallible(GUIDELINE §2.1 silently 截断),改为 `.expect("Infallible per GUIDELINE §2.1")` + 显式 `len > 12` 拒绝 | I4 wire 边界 + UX 一致性 |
+| **G5b** 测试分层未说明 | 注释 | `grpc.rs::tests` mod doc L239-252 | 写清「unit 只测纯函数 `book_to_proto`,handler 走 integration」并解释为何不在 unit 层 mock handler | 文档化测试策略,reviewer 友好 |
+| **G5c** too-long-figi 缺少测试覆盖 | **测试** | `tests/grpc_basic.rs` L141-190 | 新增 `get_snapshot_too_long_figi_rejected` + `subscribe_too_long_figi_rejected`,断言 `InvalidArgument` + 错误消息含 `too long` | 守 G5a 的行为变更,防止未来回退 |
+
+#### 行为变化清单(必写进交付 README)
+
+| 旧行为 | 新行为 |
+|---|---|
+| 过长 figi(>12 byte)→ `from_str` silently 截断 → 12 byte 前缀去 snapshot 表查 → 大概率 NotYet,client 困惑「我明明送的是有效 FIGI」 | 过长 figi → `InvalidArgument("figi too long (N bytes, max 12)")`,client 立刻看到错误 |
+| `figi_str.parse().map_err(\|_\| invalid_argument(...))` —— 看似有校验,实则 `Err` 不可能产生(Infallible) | `figi_str.parse().expect("Figi::from_str is Infallible per GUIDELINE §2.1")` —— 字面表达「这里不会失败」+ 显式 `len > 12` 拒绝在 parse **前**完成 |
+| client 主动断线但该 figi 静止时,wire-pump task 卡在 `sub.next().await` 直到下一笔 publish 才走 `try_send::Closed` 退出 —— 短时间 task 泄漏窗口(单订阅者影响极小,但语义不干净) | `out_tx.closed()` 副臂立刻喚醒退出,无 task 泄漏窗口。两条 cancel-safe 副臂保证 cancellation 立即响应。 |
+
+#### 副产品:`marketdata-types::figi_truncates_long_input` 是 Figi Infallible 的活证据
+
+跑 pass-4 测试时注意到 `crates/marketdata-types/src/lib.rs` 自带测试 `figi_truncates_long_input`(L290-293):
+
+```rust
+let f: Figi = "BBG00ABCDEF1XTRA".parse().unwrap();
+assert_eq!(f.as_str(), "BBG00ABCDEF1");
+```
+
+**意义**:这是 marketdata-types crate **自己验证「Figi::from_str silently 截断长输入」是 by-design 行为**的测试。所以 grpc.rs 层在 parse 前做长度校验,**不是空想出来的防御**,是真实需要 —— 否则 client 送 `BBG00ABCDEF1XTRA` 会被默默切成 `BBG00ABCDEF1`,语义截然不同的 FIGI。
+
+**写进交付 README 的引用方式**:在「设计取舍」段讲 `grpc.rs::get_snapshot` 那条时,可加一句:
+
+> The wire-side explicit length check (`> 12 bytes → InvalidArgument`) compensates for an Infallible-by-design behavior in `marketdata-types::Figi::from_str` (verified by its own `figi_truncates_long_input` test): the parser silently truncates oversize inputs. Surfacing this at the wire boundary avoids the silent-correctness-trap where a 24-byte client input maps to the 12-byte prefix's snapshot, returning `NotYet` despite the request looking valid.
+
+#### Cancel-safety 验证笔记(防止未来回退到 `while let`)
+
+> **产生背景**:G1 把 `while let Some(book) = sub.next().await { ... }` 重构为 `tokio::select! { sub.next() / out_tx.closed() }` 时,标准担心是「select! 的两条副臂是否 cancel-safe?某次 select 选了一条但另一条已经『推进过状态』被丢弃,导致漏消息」。
+
+**Cancel-safety 验证**(tokio 文档明示,无须 grep 源码即可確認):
+
+| 副臂 | Cancel-safe? | 依据 |
+|---|---|---|
+| `sub.next()` (内部 `mpsc::Receiver::recv`) | ✅ | tokio 文档:`mpsc::Receiver::recv` is cancel-safe;cancel 时不消费消息,下次重新 register interest 即可。本档调用 `Subscription::next` 同。 |
+| `out_tx.closed()` (内部 `mpsc::Sender::closed`) | ✅ | tokio 文档:`mpsc::Sender::closed` is cancel-safe;它只是 await 一个内部 notifier。 |
+
+**意义**:本 select! 双臂都是 cancel-safe,**每次 loop iteration 重新 register interest**,无 starvation 风险。如果未来有人为「简化」回退到 `while let`,会丢失:① wire-pump task 在 client 断线 + figi 静止时的 prompt cancellation;② N 订阅者场景下 N 个 task 各自卡到下一笔 publish 才退出的 cleanup window 拖長。
+
+**给未来自己的提醒**:任何关于「能不能把 `tokio::select!` 简化回 `while let`」的提议,必须先回到本节确认两条副臂的 cancel-safe 属性 + 重读 G1 注释里讲的退出语义。**不能因为 select! 比 while let 多 4 行就退**。
+
+#### Pass-4 教训:本轮没走复制粘贴弯路,但保留高警觉
+
+Pass-3 复盘记录了一次复制粘贴 near-miss(§6.6)。Pass-4 在重构 wire-pump task + 两处 Figi parse 时**有意识地**走「先改 GetSnapshot → `cargo test` 绿 → 再改 Subscribe → `cargo test` 绿 → 最后改 wire-pump → `cargo test` 绿」三段式 commit-by-commit 流程,**没有出现复制粘贴错误**。这是 §6.6 教训的直接产物。
+
+**给未来自己的提醒**:多点同质代码改动(本轮:两处 figi len 校验 + 两处 `.expect(Infallible)`)继续走「每段一跑 cargo test」流程,不要图省事一次性改完。
+
+---
+
+### 6.8 Pass-5 收尾盘点(`snapshot.rs` 81 行的取捨固化)
+
+> **产生背景**:Pass-5 review `snapshot.rs`(代码量极小,81 行)。代码本身**没有逻辑漏洞**,review 焦点全部落在「**已有决策的注释固化 + 测试覆盖度补齐**」—— 与 Pass-3 / Pass-4 「先识别问题,再决定是否改」的节奏不同,Pass-5 是「确认无问题,固化设计取舍以利交付」。
+>
+> **本轮立场**(承袭 Pass-3/4):严格遵守「只做功能性测试,不做效能测试」。新增的两个测试都是 deterministic 逻辑级不变量守护,不是性能 benchmark。
+
+#### 议题闭环表(4 项)
+
+| 议题 | 类型 | 改动位置 | 动作 | 守的契约 |
+|---|---|---|---|---|
+| **S1** `put` 方法 doc 缺 N3 引用 | 注释 | `snapshot.rs::put` doc | 加 `# N3 contract` 段,显式引用 GUIDELINE §0.1.3 + 指向新测试名 | N3「不做增量合并」 |
+| **S2** DashMap 选择拍板未在文件固化 | 注释 | `snapshot.rs` mod-level doc | 加「Why DashMap」段(3-4 行精简版 + 指向 §6.5 D1/D2),并顺手澄清「`Arc<T>` 不是锁」概念 | §6.5 D1/D2 的设计取捨 |
+| **S3** trait 形状决策未在文件固化 | 注释 | `snapshot.rs` mod-level doc | 加「Why no trait」段,对比 D3 `Upstream` 抽 trait 的不同动机(I4 / mock / 第二实作),回答 reviewer 「为何 Upstream 抽 trait 而 Snapshot 没抽?」 | I4 边界 + D3 决策一致性 |
+| **S4a** N3 contract 缺显式测试 | **测试** | `snapshot.rs::tests` | 新增 `put_overwrites_entire_book_not_merge`:old `bid_count=2/ask_count=1` vs new `bid_count=1/ask_count=2`,二次 put 后必须**完整反映 new**;若未来有人改 `put` 为合并,本测试 fail | N3「整份覆盖」 |
+| **S4b** `is_empty` 边界未测 | **测试** | `snapshot.rs::tests` | 新增 `is_empty_reflects_population`:起始 → `is_empty()==true`;`put` 一笔 → `is_empty()==false` | `is_empty` / `len` 公开 API 完整性 |
+| **S4c** tests mod 缺导览 | 注释 | `snapshot.rs::tests` mod doc | 加分区表(4 测试 × 守的契约)+ 写明「**不**写并发 put 测试」的理由 | reviewer 友好 + Pass-2/3/4 测试组织风格延续 |
+
+#### 拍板细节:为何**不**补并发 put 测试
+
+`Snapshot` 底层是 `DashMap`,业界已经被压测过千次。自己再写一个 `tokio::join!(put_task1, put_task2, ..., put_taskN)` 多 task 测试:
+
+| | 收益 | 代价 |
+|---|---|---|
+| 并发测试 | 「真的没 deadlock」证据 | 测试代码复杂度高;本质上**测的是 DashMap 自己**,信号弱 |
+| 不写 | 节省时间;DashMap 文档 + crates.io 5M+ downloads 已经足够信心 | 若 DashMap 真有 race 不会被本 crate 测试 catch(但应由 DashMap 自己 catch) |
+
+**结论**:不写。若未来真发现 race(几乎不可能),补 deterministic regression test 即可。Pass-5 的精力优先放在 N3 contract 这种**本 crate 独有的语义守护**。
+
+#### 副产品:固化「`Arc<T>` 不是锁」概念
+
+Mod-level doc 「Why DashMap」段中**顺手澄清**了一个常见误解:`Arc<T>` 本身**不是锁**,只是引用计数,hot path 上 `Arc::deref` 是零成本指针解引用。详细对照表见 §6.5 D2。
+
+**为何顺手加这一句**:Pass-3 §6.5 D2 已经在 DEV_PROCESS 写过完整对照表,但 `snapshot.rs` 是「Arc<DashMap<...>>」模式的主场,reviewer 直接打开 `snapshot.rs` 时若没看到这条澄清,可能误以为「Arc clone 在 ingest hot path 会拖延迟」—— 这正是 §6.5 D2 已经处理的认知误区。在源文件 mod-doc 加一行,确保**单文件可读时也不会产生误解**。
+
+#### Pass-5 教训:Review 也可以是「确认无问题 + 固化」
+
+Pass-1 / 2 / 3 / 4 都识别出至少 1 项需要改的代码或注释。Pass-5 是**第一个「代码无逻辑变更」的 pass**,纯粹是:
+
+1. 把已有正确决策的理由写进源文件(mod-doc 扩展)。
+2. 把已有正确行为(N3 整份覆盖、`is_empty` 边界)写成回归告警(新增 2 个 deterministic 测试)。
+
+**为何这样的 pass 仍有价值**:reviewer 不会读 DEV_PROCESS(那是开发过程文档);reviewer 会读 `snapshot.rs` 本身。把 §6.5 D1/D2 / D3 的拍板**搬一句进源文件**,reviewer 单文件可读时就能看到工程判断,不需要交叉跳读。这是 take-home 评分中「**密度比长度重要**」(GUIDELINE §14.4)原则的落地。
+
+**给未来自己的提醒**:不要因为「Pass-5 没改代码逻辑」就跳过本节。Review 的产出**不只是 bugfix**,更是「**让设计意图在每个文件内部独立可读**」。
 
 ---
 
