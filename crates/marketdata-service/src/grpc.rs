@@ -5,13 +5,15 @@
 //!
 //! # 设计要点
 //!
-//! - `GetSnapshot` 是 unary RPC：直接读 [`Snapshot::get`]；`None` → `NotYet`，
-//!   `Some` → `Found(Book)`（README §3 的 "clearly-defined no data yet"）。
-//! - `Subscribe` 是 server-streaming：照 GUIDELINE §4.3.4 模板，**严禁 `send().await`**。
-//!   wire 阶段 `try_send` 与 fan-in 阶段共用同一个 `dropped` 计数器
-//!   （`Subscription::dropped_counter`），所以 `BookUpdate.dropped_total` 是
-//!   "fan-in 丢" + "wire 丢" 的累积值。
-//! - `BookMessage ↔ proto::Book` 的转换是纯机械映射，集中放在本档底部。
+//! - `GetSnapshot` 是 unary RPC：直接读 [`Snapshot::get`]；`None` → `NotYet`,
+//!   `Some` → `Found(Book)` —— 即题面要求的 "clearly-defined no data yet"。
+//! - `Subscribe` 是 server-streaming, wire 端 **严禁 `send().await`**：任何 await
+//!   都会让慢 client 反压到 fan-in, 再回压 ingest, 违反 "ingest 永不阻塞" 不
+//!   变量。本档统一用 `try_send`, 满了直接丢 + 累进 `dropped_total`。
+//! - wire 阶段 `try_send` 与 fan-in 阶段共用同一个 `dropped` 计数器
+//!   (`Subscription::dropped_counter`), 所以 `BookUpdate.dropped_total` 是
+//!   "fan-in 丢" + "wire 丢" 的全链路累积值。
+//! - `BookMessage ↔ proto::Book` 的转换是纯机械映射, 集中放在本档底部。
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -54,9 +56,8 @@ use pb::{
 pub struct MarketDataService {
     snapshot: Arc<Snapshot>,
     bus: Arc<Bus>,
-    /// Wire 端 mpsc 的容量。这是 GUIDELINE §4.2 "唯一陷阱" 的关键参数：
-    /// tonic server-streaming 默认会把背压传回 producer，必须在此处 try_send
-    /// 切断。容量影响 client 短暂 lag 时的容忍度。
+    /// Wire 端 mpsc 的容量。tonic server-streaming 默认会把背压传回 producer,
+    /// 这里靠 `try_send` 切断;容量决定 client 短暂 lag 时的容忍度。
     subscriber_queue_size: usize,
 }
 
@@ -81,9 +82,9 @@ impl MarketData for MarketDataService {
         request: Request<GetSnapshotRequest>,
     ) -> Result<Response<SnapshotResponse>, Status> {
         let figi_str = request.into_inner().figi;
-        // Figi::from_str 是 Infallible(GUIDELINE §2.1)—— 长度 > 12 byte 会 silently
-        // 截断而非报错。wire 层显式拒绝过长 figi,避免客户端送 "BBG_LONG_FIGI" 被切成
-        // 前 12 byte 后大概率返 NotYet 的诡异 UX。
+        // `Figi::from_str` 在 upstream 是 Infallible —— 长度 > 12 byte 会 silently
+        // 截断而非报错。wire 层显式拒绝过长 figi, 避免客户端送 "BBG_LONG_FIGI"
+        // 被切成前 12 byte 后大概率返 NotYet 的诡异 UX。
         if figi_str.len() > 12 {
             return Err(Status::invalid_argument(format!(
                 "figi too long ({} bytes, max 12)",
@@ -92,9 +93,8 @@ impl MarketData for MarketDataService {
         }
         let figi: Figi = figi_str
             .parse()
-            .expect("Figi::from_str is Infallible per GUIDELINE §2.1");
+            .expect("Figi::from_str is Infallible; length already bounded above");
 
-        // README §3 的两种合法返回：Found / NotYet。
         let result = match self.snapshot.get(&figi) {
             Some(book) => SnapshotResult::Found(book_to_proto(&book)),
             None => SnapshotResult::NotYet(NotYet {}),
@@ -119,9 +119,10 @@ impl MarketData for MarketDataService {
             return Err(Status::invalid_argument("subscribe with empty figi list"));
         }
 
-        // String → Figi 转换。单条解析失败即拒绝整个请求(all-or-nothing)。
-        // 同 get_snapshot:Figi::from_str 是 Infallible(GUIDELINE §2.1 silently 截断),
-        // 显式拒绝过长入参,避免静默切断后的诡异 UX。
+        // String → Figi 转换。单条解析失败即拒绝整个请求 (all-or-nothing) —— 比
+        // "默默丢掉非法 figi 只订阅剩下的" 语义更清晰, 调用方不会得到漏订阅但
+        // 状态码 OK 的 silent 失败。`Figi::from_str` 本身 Infallible (silently
+        // 截断), wire 层显式拒长 figi 避免诡异 UX。
         let figis: Vec<Figi> = figi_strs
             .into_iter()
             .map(|s| -> Result<Figi, Status> {
@@ -132,7 +133,7 @@ impl MarketData for MarketDataService {
                     )));
                 }
                 Ok(s.parse::<Figi>()
-                    .expect("Figi::from_str is Infallible per GUIDELINE §2.1"))
+                    .expect("Figi::from_str is Infallible; length already bounded above"))
             })
             .collect::<Result<_, _>>()?;
 
@@ -164,15 +165,15 @@ impl MarketData for MarketDataService {
                         let Some(book) = book else { break };
                         let upd = BookUpdate {
                             book: Some(book_to_proto(&book)),
-                            // dropped.load(Relaxed) 可能滞后 fan-in 端 fetch_add 一刹那
-                            // —— 多个 fan_in_one task 并发 add,本 task 单 load。
-                            // benign:dropped_total 是累积值,client 用 (curr - prev)
-                            // 算 delta;此次 sample 漏掉的会出现在下一笔 BookUpdate,
-                            // 最终累积值正确(GUIDELINE §4.3.3 累积值语义)。
+                            // `load(Relaxed)` 可能滞后 fan-in 端 `fetch_add` 一
+                            // 刹那 —— 多个 fan_in_one task 并发 add, 本 task 单
+                            // load。benign:dropped_total 是累积值, 此次 sample
+                            // 漏掉的下一笔 BookUpdate 必体现, 最终累积值正确。
                             dropped_total: dropped.load(Ordering::Relaxed),
                         };
-                        // ★ 必须 try_send,不能 await(GUIDELINE §4.2 "唯一陷阱")。
-                        // 任何 await 都会让慢 client 反压到 fan-in,再回压 ingest,违反 I1。
+                        // ★ 必须 try_send, 不能 await。任何 await 都会让慢 client
+                        //   反压到 fan-in, 再回压 ingest, 违反 "ingest 永不阻塞"
+                        //   不变量 —— 整个 service 设计的硬约束。
                         match out_tx.try_send(Ok(upd)) {
                             Ok(()) => {}
                             Err(TrySendError::Full(_)) => {
@@ -214,8 +215,9 @@ impl MarketData for MarketDataService {
 ///
 /// 注意：
 /// - `Figi` 是 `[u8; 12]` (NUL-padded)，调用 `as_str()` 即可自动 trim。
-/// - 只输出 `bid_count` / `ask_count` 内的有效 levels（GUIDELINE §2.1 fact）。
-///   `BookLevel` 是 `Copy`，但 proto `Level` 没有 `From<BookLevel>` —— 一行 lambda 转完。
+/// - 只输出 `bid_count` / `ask_count` 内的有效 levels (upstream 契约:数组其余
+///   位置是 `BookLevel::default()` 占位, 不应进 wire)。`BookLevel` 是 `Copy`,
+///   但 proto `Level` 没有 `From<BookLevel>` —— 一行 lambda 转完。
 fn book_to_proto(msg: &BookMessage) -> Book {
     Book {
         figi: msg.figi.as_str().to_string(),
@@ -242,18 +244,19 @@ fn level_to_proto(level: &marketdata_types::BookLevel) -> Level {
 mod tests {
     //! grpc.rs 测试分层:
     //!
-    //! - **本档(unit)**:只测**纯转换函数** `book_to_proto` —— `BookMessage` 是
-    //!   `Copy`,转 proto 不涉及 IO / spawn / runtime,适合 deterministic 单测。
-    //! - **`tests/grpc_basic.rs`(integration)**:覆盖 handler 在真 gRPC wire 上的
-    //!   行为 —— `GetSnapshot` NotYet/Found 切换、`Subscribe` 推流、空 figi / too-long
-    //!   figi 被拒绝。需要 tonic server + client,跑得稍慢但是「真路径」证据。
-    //! - **`tests/grpc_slow_consumer.rs`(`#[ignore]` 手动)**:I2 wire 层压力测试
-    //!   (详见 DEV_PROCESS §5.1)。
+    //! - **本档 (unit)**: 只测**纯转换函数** `book_to_proto` —— `BookMessage`
+    //!   是 `Copy`, 转 proto 不涉及 IO / spawn / runtime, 适合 deterministic
+    //!   单测。
+    //! - **`tests/grpc_basic.rs` (integration)**: 覆盖 handler 在真 gRPC wire
+    //!   上的行为 —— `GetSnapshot` NotYet/Found 切换、`Subscribe` 推流、空
+    //!   figi / too-long figi 被拒绝。
+    //! - **`tests/grpc_slow_consumer.rs` (`#[ignore]` 手动)**: wire 层慢消费者
+    //!   隔离的压力测试 —— 证明 wire 路径也守得住 "ingest 不阻塞" 不变量。
     //!
     //! 不在本档加 handler unit test 的理由:`MarketData::*` 是 `async fn` +
-    //! `Request<T>`,直接 unit 测要么 mock 太多(失去信号),要么本质上重写
-    //! integration 流程(重复成本)。让 integration 层守 handler 逻辑、unit 层守
-    //! 纯函数,分工更干净。
+    //! `Request<T>`, 直接 unit 测要么 mock 太多 (失去信号), 要么本质上重写
+    //! integration 流程 (重复成本)。让 integration 层守 handler 逻辑、unit 层
+    //! 守纯函数, 分工更干净。
 
     use super::*;
 

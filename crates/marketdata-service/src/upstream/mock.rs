@@ -1,27 +1,3 @@
-//! Phase 3 测试专用的可控 [`Upstream`] 实现。
-//!
-//! # 与 feed-sim 的对比
-//!
-//! | 维度 | `FeedSimUpstream` | `MockUpstream` |
-//! |---|---|---|
-//! | 数据生成方式 | 内部背景线程按 `rate_hz` 节奏生成 | 测试通过 [`MockHandle::push`] 显式注入 |
-//! | 速率控制 | env / `SubscriberConfig::rate_hz` | 测试代码全权决定 |
-//! | 终止信号 | `max_messages` cap 或 drop | [`MockHandle::close`] |
-//! | 决定性 | 同 seed 可重现 | 100% 决定性（无 RNG / 无背景线程） |
-//! | `wait` 响应延迟 | poll 间隔 | condvar 唤醒（push / close 即时 wake） |
-//!
-//! # 为什么不复用 `feed-sim`
-//!
-//! `feed-sim` 是黑盒上游（README "What's provided"），无法注入"恰好 seq=1,2,5"
-//! 这种 gap 序列；也无法在测试期间精确控制 ingest 看到的消息数。Mock 让测试
-//! 既快又精确。
-//!
-//! # 为什么 publish API 用 [`MockHandle`] 而非 `&MockUpstream`
-//!
-//! `MockUpstream` 被 `move` 进 ingest 线程后，测试持有的是 [`MockHandle`]
-//! 别名（内部 `Arc<Inner>` clone）。这样 ingest / 测试两边各拿自己的句柄，
-//! 互不干扰；`MockUpstream::new()` 构造时同时返回两端。
-
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -94,7 +70,8 @@ impl Upstream for MockUpstream {
     /// 阻塞最多 `duration`；提前唤醒条件：push / close。
     ///
     /// 返回 `Err(())` 仅当 closed **且** queue 排空 —— 与 feed-sim 的
-    /// "唯一合法的结束信号" 语义一致（GUIDELINE §3.2）。
+    /// "唯一合法的结束信号" 语义对齐, 保证 ingest_loop 的 EOF 判定逻辑
+    /// 在 mock 路径与真实 upstream 路径上行为一致。
     fn wait(&self, duration: Duration) -> Result<(), ()> {
         let inner = &*self.inner;
         let guard = inner.queue.lock().unwrap();
@@ -150,10 +127,12 @@ impl MockHandle {
         self.inner.closed.store(true, Ordering::Release);
         self.inner.cv.notify_all();
     }
+}
 
-    /// 累计 push 笔数。
-    #[allow(dead_code)]
-    pub fn total_pushed(&self) -> u64 {
+#[cfg(test)]
+impl MockHandle {
+    /// 测试用 helper:累计 push 笔数, 与 `Upstream::total_generated()` 互校。
+    pub(crate) fn total_pushed(&self) -> u64 {
         self.inner.total.load(Ordering::Relaxed)
     }
 }
@@ -179,20 +158,16 @@ pub fn make_book(figi: &str, gateway_seq: u64) -> BookMessage {
 
 #[cfg(test)]
 mod tests {
-    //! `MockUpstream` 自身正确性测试("测试的测试")。
+    //! `MockUpstream` 自身正确性测试 ("测试的测试")。
     //!
-    //! 守的契约(与 [`super::Upstream`] trait 的实作语义一一对应):
+    //! 守的契约 (与 [`super::Upstream`] trait 的实作语义一一对应):
     //!
     //! | 测试 | 守的契约 |
     //! |---|---|
     //! | `push_then_receive_in_fifo_order` | `receive` 是 FIFO + 排空后返 `Ok(None)` |
-    //! | `wait_returns_err_after_close_and_drain` | 与 feed-sim 一致:**closed 且 queue 空**才返 `Err(())`(GUIDELINE §3.2 唯一合法结束信号) |
-    //! | `wait_wakes_up_on_push` | condvar 唤醒生效:push 后 ≤200ms 内唤醒,**不是** poll-sleep 假冒 |
-    //! | `total_generated_tracks_pushes` | 累计计数等于 push 次数(对应 `Upstream::total_generated`) |
-    //!
-    //! 这四条共同保证:Phase 3 / Pass-X 用 MockUpstream 注入的整合测试,**底层
-    //! mock 行为本身**与 feed-sim 黑盒上游语义一致 —— 若 mock 自己就违反契约,
-    //! 任何上层测试通过都没意义。
+    //! | `wait_returns_err_after_close_and_drain` | 与 feed-sim 一致:**closed 且 queue 空**才返 `Err(())` —— 唯一合法的 EOF 信号 |
+    //! | `wait_wakes_up_on_push` | condvar 唤醒生效:push 后 ≤200ms 内唤醒, **不是** poll-sleep 假冒 |
+    //! | `total_generated_tracks_pushes` | 累计计数等于 push 次数 (对应 `Upstream::total_generated`) |
 
     use super::*;
     use std::thread;

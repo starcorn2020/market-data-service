@@ -1,4 +1,4 @@
-//! Phase 1 二进位 entrypoint。
+//! Server 二进位 entrypoint。
 //!
 //! 跑法：
 //!
@@ -9,9 +9,12 @@
 //! ```
 //!
 //! 通过条件：
+//!
 //! - stderr 看到 `[ingest] received=... snapshot.len=10 gaps=0 ...` 持续打出
 //! - 最后看到 `[ingest] stopped: received=1000 ...`
 //! - 进程退出码 0
+//!
+//! Sample client 是另一个 binary, 用法见 `src/bin/client.rs` 顶部 doc。
 
 use marketdata_service::{BoxError, Service, ServiceConfig};
 

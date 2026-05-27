@@ -1,67 +1,52 @@
-//! **T1-E2E（DEV_PROCESS §5.1）**：在真实 gRPC wire 路径上**压力测试** I2 隔离。
+//! 在真实 gRPC wire 路径上的慢消费者隔离 **压力测试**。
 //!
-//! # ★ 状态:`#[ignore]` 默认不跑(理由见下)
+//! # 状态:`#[ignore]`,不计入默认 `cargo test` 绿灯
 //!
-//! 本测试已**不计入 `cargo test --workspace` 的 baseline 绿灯**。手动触发:
+//! 手动触发:
 //!
 //! ```bash
 //! cargo test -p marketdata-service --test grpc_slow_consumer -- --ignored
 //! ```
 //!
-//! ## 为什么 ignore
+//! # 为什么 `#[ignore]`
 //!
-//! 这是**压力测试**而非不变量测试。要让 `slow_dropped > 0` 必然成立,得让
-//! 慢路 buffer 真的撑爆 —— 而最大的一层 buffer 是 **HTTP/2 stream flow
-//! control window(默认 65535 bytes)**,它能容纳的"笔数"取决于 wire payload:
+//! "慢/断订阅者隔离" 这条**逻辑不变量**已由 `src/bus.rs` 的 unit 测试守住:
 //!
-//! | book 来源 | wire size / 笔 | window 容量 |
+//! - `slow_consumer_isolation` — fast/slow 在 Bus 层并存, fast 不被反压。
+//! - `disconnected_subscriber_does_not_stall_others` — 断开订阅者不波及兄弟。
+//!
+//! 二者**与 buffer 大小无关**, 只验证 "每订阅者独立 mpsc + `try_send` 失败
+//! 累进 `dropped`" 的逻辑正确性 —— 这才是题目要的隔离语义。
+//!
+//! 本档测的是**性能 characterization** (能否在真实 wire 上观测到 dropped > 0),
+//! 受 HTTP/2 flow control window、TCP send/recv buffer、kernel 网络栈等系统
+//! 级参数影响, 在某些环境 (macOS M-series 默认 sysctl) 下 slow 端可能"够快"
+//! 把所有 240 KB 在 stall 期间全收完, 即使逻辑完全正确, 测试也会 fail。
+//!
+//! 保留代码而非删除:不同 TCP 配置 / 跨主机部署下本测试仍是验证 wire 容量
+//! 假设的实用工具, 且下方的量化推导是 reviewer 询问 "你 buffer 怎么调?" 时
+//! 的现成答案。
+//!
+//! # 关键陷阱:wire payload 必须够大
+//!
+//! `BookMessage` 经 protobuf 编码后的实际字节数决定 HTTP/2 window 能装多少笔:
+//!
+//! | book 构造方式 | wire size/笔 | 65535 byte window 容量 |
 //! |---|---|---|
-//! | `make_book(figi, seq)` 空壳（`bid_count=0 / ask_count=0`） | **~25 bytes** | **~2600 笔** |
-//! | `full_book(figi, seq)`（本档内 10 bids + 10 asks 全填） | **~480 bytes** | **~134 笔** |
+//! | `make_book(figi, seq)` 空壳 (`bid_count=0 / ask_count=0`) | ~25 B | ~2600 笔 |
+//! | `full_book(figi, seq)` (本档内, 10 bids + 10 asks 全填) | ~480 B | ~134 笔 |
 //!
-//! 即使本版本用 `full_book` + TOTAL=500 + 1500ms stall,实测在 macOS M-series
-//! 上 wire 仍可能在 stall 期间把所有 240 KB 推完(系统 TCP send/recv buffer +
-//! adaptive HTTP/2 window 在某些 kernel/network stack 上会一起放大有效窗口)。
-//! 真正稳定触发需要更激进的压力参数,会让测试跑得更慢且仍不能消除环境依赖。
+//! 必须用 `full_book` + 足够 TOTAL 才能让 wire buffer 撑爆;空壳直接装满
+//! 整个 window, 测试退化为 "client 收得快不快"。
 //!
-//! **I2 不变量本身**已由 `src/bus.rs` 的两个 unit 测试守住:
-//! - `slow_consumer_isolation` — 慢消费者隔离(fast/slow 在 Bus 层并存)
-//! - `disconnected_subscriber_does_not_stall_others` — 断开消费者隔离
+//! # 压力参数 (本档当前值)
 //!
-//! 那两个测试**与 buffer 大小无关**,只验证逻辑:每订阅者独立 mpsc + `try_send`
-//! 失败累进 `dropped`,fast 不被 slow 反压。这才是 I2 真正要守的。
+//! - `bus_channel_capacity = 16`, `subscriber_queue_size = 4` (override `test_config`)
+//! - `TOTAL = 500` 笔, `full_book` 每笔 ~480 B → ~240 KB > window 65535 B
+//! - publisher 2ms/笔 (总 1000ms);slow 先 stall 1500ms → 推完后 slow 仍 stall 500ms
+//! - slow drain deadline 3000ms;fast deadline 4000ms
 //!
-//! ## 测试范畴的边界
-//!
-//! 实测发现:在本机环境下难以稳定触达单机 gRPC wire 路径的丢失阈值——
-//! 单机上限取决于 HTTP/2 flow control window、TCP send/recv buffer、adaptive
-//! window 等系统级参数,要严格逼出 wire mpsc 满载,需配合 **dedicated
-//! performance 工具**(criterion benchmark / 专用 load generator / 调整
-//! kernel net.* sysctl 等)。
-//!
-//! 这属于 **性能测试(performance characterization)** 范畴,与"验证 I2
-//! 逻辑正确"是不同的工程问题,**不在本次三天 deliverable 的测试覆盖范围内**。
-//! 本测试代码保留作为该方向的起点,但默认 `#[ignore]` 不影响 baseline 绿灯。
-//!
-//! ## 为什么保留代码而非删除
-//!
-//! 1. **README §4 直接对应**:reviewer 会按"slow consumer"搜测试名;保留代码 +
-//!    `#[ignore]` 让搜索仍命中,且 doc-comment 解释清楚定位。
-//! 2. **手动跨主机 / Linux 环境**:在不同 TCP buffer / HTTP/2 配置下,本测试
-//!    依然是验证生产部署 wire 容量假设的实用工具。Phase 4 交付 README 可引用
-//!    本档作为「performance characterization 起点」。
-//! 3. **量化推导是交付资产**:檔头的 buffer 4 层表 + wire size 影响表是
-//!    follow-up 高分点("你 buffer 怎么调?" → 直接展示这张表)。
-//!
-//! # 压力参数(供手动跑参考)
-//!
-//! - `bus_channel_capacity = 16`,`subscriber_queue_size = 4`(common::test_config)
-//! - **TOTAL = 500** + **`full_book` 而非 `make_book`**(空壳会让 wire size 小到
-//!   500 笔全装进 HTTP/2 window)。
-//! - publisher 2ms/笔(总 1000ms)< slow stall 1500ms — 推完后 slow 仍 stall。
-//! - slow drain deadline 3000ms;fast deadline 4000ms。
-//!
-//! 实测在严格 HTTP/2 default window 实现上 `slow_dropped` 应到 300+。
+//! 严格 HTTP/2 default window 实现上 `slow_dropped` 应到 300+。
 
 mod common;
 
@@ -72,12 +57,12 @@ use marketdata_service::pb::SubscribeRequest;
 use marketdata_types::{BookLevel, BookMessage, Figi};
 use tokio_stream::StreamExt;
 
-/// 构造一个**满载** `BookMessage`(10 bids + 10 asks 全填非零),用于撑大 wire
-/// payload 让 HTTP/2 flow control window 必然爆。
+/// 构造一个**满载** `BookMessage` (10 bids + 10 asks 全填非零), 用于撑大
+/// wire payload, 让 HTTP/2 flow control window 必然爆。
 ///
-/// 与 `marketdata_service::make_book` 的区别(详见档头「关键陷阱」段):
-/// `make_book` 的 `bid_count/ask_count` 都是 0,wire 上每笔仅 ~25 bytes;
-/// 本函数让每笔 ~480 bytes,500 笔 ≈ 240 KB → 远超 stream window 65535 bytes。
+/// 与 `marketdata_service::make_book` 的区别 (详见档头「关键陷阱」段):
+/// `make_book` 的 `bid_count/ask_count` 都是 0, wire 上每笔仅 ~25 bytes;
+/// 本函数让每笔 ~480 bytes, 500 笔 ≈ 240 KB → 远超 stream window 65535 bytes。
 fn full_book(figi: &str, gateway_seq: u64) -> BookMessage {
     let mut m = BookMessage {
         figi: figi.parse::<Figi>().expect("Figi::from_str is Infallible"),
@@ -88,9 +73,9 @@ fn full_book(figi: &str, gateway_seq: u64) -> BookMessage {
         ..Default::default()
     };
     for i in 0..10 {
-        // 用 seq 与 level index 混合的值,避免 protobuf 把全 0 编码成 0 byte。
-        // `orders` 是 u16(GUIDELINE / BookLevel 字段定义);TOTAL=500 内 mod 10000
-        // 保证 fit u16 且每筆都有变化,wire encoding 长度稳定。
+        // 用 seq 与 level index 混合的值, 避免 protobuf 把全 0 编码成 0 byte。
+        // `orders` 是 u16(`BookLevel` 定义);TOTAL=500 内 mod 10000 保证 fit
+        // u16 且每筆都有变化, wire encoding 长度稳定。
         let mix = ((gateway_seq + i as u64 + 1) % 10000) as u16;
         m.bids[i] = BookLevel {
             price: 100.0 - i as f64 * 0.5 + (gateway_seq as f64 * 0.01),
@@ -106,9 +91,8 @@ fn full_book(figi: &str, gateway_seq: u64) -> BookMessage {
     m
 }
 
-// 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "stress test, env-dependent. I2 invariant 由 bus.rs unit 测试守住;\
+#[ignore = "stress test, env-dependent. 隔离不变量由 bus.rs unit 测试守住;\
             本测试供手动 wire-level 压力跑:\
             `cargo test -p marketdata-service --test grpc_slow_consumer -- --ignored`"]
 async fn slow_consumer_isolation_e2e() -> Result<(), BoxError> {
@@ -202,28 +186,28 @@ async fn slow_consumer_isolation_e2e() -> Result<(), BoxError> {
     let (slow_got, slow_dropped) = slow_task.await?;
 
     eprintln!(
-        "[T1-E2E] fast: got={fast_got} dropped_total={fast_dropped} | \
+        "[stress] fast: got={fast_got} dropped_total={fast_dropped} | \
          slow: got={slow_got} dropped_total={slow_dropped}"
     );
 
-    // ★ I2 关键断言（wire 级）。
+    // ★ 隔离关键断言 (wire 级)。
     assert!(
         fast_got >= TOTAL - 5,
-        "fast 应收到几乎全部（≥{} of {TOTAL}），实际 {fast_got}",
+        "fast 应收到几乎全部 (≥{} of {TOTAL}), 实际 {fast_got}",
         TOTAL - 5
     );
     assert!(
         fast_dropped <= 5,
-        "I2: 快 client 应几乎 0 损失（容忍 ≤5 调度噪声）, 实际 dropped_total={fast_dropped}"
+        "快 client 应几乎 0 损失 (容忍 ≤5 调度噪声), 实际 dropped_total={fast_dropped}"
     );
     assert!(
         slow_dropped > 0,
-        "I2: 慢 client 必须看到 dropped_total > 0（slow 在 publisher 推完前 stall 800ms,\
-         buffer 必爆）, 实际 {slow_dropped}"
+        "慢 client 必须看到 dropped_total > 0 (slow 在 publisher 推完前 stall 800ms, \
+         buffer 必爆), 实际 {slow_dropped}"
     );
     assert!(
         slow_got < fast_got,
-        "慢 client 收到应严格少于快 client：slow={slow_got} fast={fast_got}"
+        "慢 client 收到应严格少于快 client:slow={slow_got} fast={fast_got}"
     );
 
     mock.close();

@@ -1,23 +1,12 @@
 //! 上游 feed 抽象层。
 //!
-//! # I4 不变量在哪里被守护
+//! 整个 service crate 里**唯一**可以 `use feed_sim::*` 的地方 —— 所有跨
+//! module 的调用都走 [`Upstream`] trait, 把 vendor 类型封死在本 mod 内:
 //!
-//! GUIDELINE §5 I4 要求"对外 API 不洩漏 `feed_sim::*`"。本 module 是
-//! 整个 service crate 里**唯一**可以 `use feed_sim::*` 的地方——所有
-//! 跨 module 的调用都走 [`Upstream`] trait，从而做到：
-//!
-//! 1. 任何依赖 `Upstream` 的代码（`ingest.rs` / 未来的 mock 测试）都看不见
-//!    `FeedSubscriber`。
-//! 2. 未来把 `feed-sim` 换成真实 iceoryx2，只需新增 `upstream/iceoryx2.rs`
-//!    并实作同一个 trait，**ingest.rs 与 lib.rs 0 改动**。
-//!
-//! # D3 选项 A：静态分派
-//!
-//! [`crate::ingest::spawn`] 走泛型 `<U: Upstream>` 而不是 `Box<dyn Upstream>`。
-//! 理由：
-//!
-//! - Ingest 是数据热路径（每秒上千次 `receive` / `wait`），不容忍虚函数开销。
-//! - Phase 3 注入 mock 时直接 `spawn::<MockUpstream>(...)`，编译期单态化即可。
+//! 1. 任何依赖 `Upstream` 的代码 (`ingest.rs` / mock 测试) 都看不见
+//!    `feed_sim::FeedSubscriber`。
+//! 2. 未来把 `feed-sim` 换成真实 iceoryx2 (或别的上游), 只需新增
+//!    `upstream/iceoryx2.rs` 实现 `Upstream` trait, 其它 mod 0 改动。
 
 use std::time::Duration;
 
@@ -47,7 +36,7 @@ pub trait Upstream: Send {
     //
     // `Result<(), ()>` 对齐 `feed_sim::FeedSubscriber::wait` 写死的契约 ——
     // `Err(())` 是 feed-sim 的唯一合法结束讯号(无 error variant 区分),改 custom
-    // error type 会破坏 I3(feed-sim 边界对应)。clippy `result_unit_err` 此处忽略。
+    // error type 会破坏 feed-sim 边界对应。clippy `result_unit_err` 此处忽略。
     #[allow(clippy::result_unit_err)]
     fn wait(&self, duration: Duration) -> Result<(), ()>;
 

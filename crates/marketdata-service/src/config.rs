@@ -2,16 +2,16 @@
 //!
 //! # 设计要点
 //!
-//! - [`UpstreamConfig`] 是 service crate **自己拥有**的 plain struct，**不**直接复用
-//!   `feed_sim::SubscriberConfig`。这是 GUIDELINE I4 不变量的核心抓手：未来把
-//!   `feed-sim` 换成真实 iceoryx2 时，本 struct 的字段会跟着重定义，
-//!   但 [`ServiceConfig`] 的对外 shape 保持不动，调用方与 wire schema 0 改动。
+//! - [`UpstreamConfig`] 是 service crate **自己拥有**的 plain struct,**不**
+//!   直接复用 `feed_sim::SubscriberConfig`。这把 feed-sim 的类型边界封死在
+//!   `upstream::feed_sim` 模块内:未来换成真实 iceoryx2 时,本 struct 的字段
+//!   重定义即可,[`ServiceConfig`] 对外 shape 与 wire schema 0 改动。
 //!
-//! - [`UpstreamConfig`] 到 `SubscriberConfig` 的映射是 `From` impl，
-//!   **仅 service crate 内部**（`upstream::feed_sim`）使用，不出 crate 边界。
+//! - [`UpstreamConfig`] → `SubscriberConfig` 的映射是 `From` impl,**仅 service
+//!   crate 内部**(`upstream::feed_sim`)使用,不出 crate 边界。
 //!
-//! - 环境变量命名：Phase 1 直接读 feed-sim 既有的 `SIM_*`（reviewer 跑 README
-//!   时不困惑）；未来若抽 `marketdata-protocol` 子 crate，统一改 `MDS_UPSTREAM_*`。
+//! - 环境变量命名:上游字段直接复用 feed-sim 既有的 `SIM_*`(reviewer 跑
+//!   `feed-sim` 自己的 demo 时不困惑);本 crate 引入的字段加 `MDS_` 前缀。
 
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -46,7 +46,7 @@ pub struct UpstreamConfig {
     /// `gateway_seq` 起始值。
     pub start_seq: u64,
 
-    /// 上游内部 buffer 容量；满了会丢最旧（GUIDELINE §3.4 slow consumer 语义）。
+    /// 上游内部 buffer 容量；满了会丢最旧（slow consumer 语义）。
     pub buffer_size: usize,
 
     /// `None` => steady pacing；`Some(n)` => bursty:n。
@@ -69,8 +69,7 @@ impl Default for UpstreamConfig {
 }
 
 // 仅供 service crate 内部使用（`upstream::feed_sim::FeedSimUpstream::new`）。
-// 这条 From 是 I4 的"密封点"——所有 `feed_sim::SubscriberConfig` 的构造都
-// 收敛到这一处。
+// 全 crate 唯一一处构造 `feed_sim::SubscriberConfig` —— 边界类型不外泄的密封点。
 impl From<UpstreamConfig> for SubscriberConfig {
     fn from(c: UpstreamConfig) -> Self {
         SubscriberConfig {
@@ -100,7 +99,7 @@ pub struct ServiceConfig {
     pub upstream: UpstreamConfig,
 
     /// Ingest 线程对 `Upstream::wait` 的 poll 间隔。
-    /// 太长 → 关闭信号延迟；太短 → 空转。50ms 是 GUIDELINE §3.3 示范值。
+    /// 太长 → 关闭信号延迟；太短 → 空转。50ms 是一个保守默认。
     pub poll_interval: Duration,
 
     /// 每个 FIGI 的 `tokio::sync::broadcast` 容量。
@@ -108,15 +107,16 @@ pub struct ServiceConfig {
     /// 由 `Bus` 的 fan-in task 累进 `dropped_total`。
     pub bus_channel_capacity: usize,
 
-    /// 每个订阅者 fan-in mpsc 的容量（Phase 2 gRPC handler 会用到）。
+    /// 每个订阅者 fan-in mpsc 的容量。gRPC handler 在 wire 阶段也用此 channel,
+    /// 满即丢 + 累进 `dropped_total`。
     pub subscriber_queue_size: usize,
 
-    /// Ingest 每 N 笔在 stderr 打一次进度（0 = 关）。Phase 1 demo 用。
+    /// Ingest 每 N 笔在 stderr 打一次进度（0 = 关）。仅用于 demo 输出。
     pub progress_log_every: u64,
 
-    /// gRPC server 监听地址。默认 `0.0.0.0:50051`（同主机 + 跨主机两用，README §5）。
+    /// gRPC server 监听地址。默认 `0.0.0.0:50051`,同主机 + 跨主机两用。
     ///
-    /// **不要**改成 `127.0.0.1:50051`：那样 LAN client 连不通，违反 README §5
+    /// **不要**改成 `127.0.0.1:50051` —— 那样 LAN client 连不通,违反题面
     /// "Works for clients on the same host and on a remote machine"。
     pub listen_addr: SocketAddr,
 }
@@ -129,7 +129,7 @@ impl Default for ServiceConfig {
             bus_channel_capacity: 1024,
             subscriber_queue_size: 1024,
             progress_log_every: 100,
-            // 0.0.0.0 而非 127.0.0.1 —— 跨主机支持是 README §5 硬要求。
+            // 0.0.0.0 而非 127.0.0.1 —— 跨主机连入是题面硬要求。
             listen_addr: "0.0.0.0:50051".parse().expect("hardcoded addr valid"),
         }
     }
@@ -279,9 +279,8 @@ mod tests {
         assert!(cfg.validate().is_err());
     }
 
-    /// `validate()` 的第三条 check(subscriber_queue_size > 0)与
-    /// bus_channel_capacity / poll_interval 对称覆盖,避免「漏一个 check 没测试
-    /// 守护」的 silent gap。
+    /// 与 `bus_channel_capacity` / `poll_interval` 对称覆盖,避免「validate 加
+    /// 了 check 但没测试守护」的 silent gap。
     #[test]
     fn rejects_zero_subscriber_queue_size() {
         let cfg = ServiceConfig {

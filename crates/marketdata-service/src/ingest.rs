@@ -2,16 +2,18 @@
 //!
 //! # 为什么是 `std::thread` 而不是 `tokio::task`
 //!
-//! GUIDELINE §7.1 / §11：[`crate::upstream::Upstream`] 是同步阻塞 API
-//! （`wait()` 内部 `thread::sleep`），放进 tokio worker 会占住一个 OS thread，
-//! 干扰其它 async 任务。专用 OS thread 是正解。
+//! [`crate::upstream::Upstream`] 是同步阻塞 API（`wait()` 内部 `thread::sleep`），
+//! 放进 tokio worker 会占住一个 OS thread, 干扰其它 async 任务。专用 OS
+//! thread 是正解。
 //!
 //! # 不变量
 //!
-//! - **I1**：ingest 永不被任何下游阻塞。`snapshot.put` 是 DashMap shard write lock
-//!   （极短），`bus.publish` 是 broadcast::send（容量满自动丢最旧，非阻塞）。
-//! - **顺序**：先 `snapshot.put` 后 `bus.publish` —— 订阅者收到 update 时，
-//!   `GetSnapshot(figi)` 一定能读到至少同一笔（GUIDELINE §4.2 "先写快照，后广播"）。
+//! - **Ingest 永不被下游阻塞**：`snapshot.put` 是 DashMap shard write lock
+//!   (极短), `bus.publish` 是 `broadcast::send` (容量满自动丢最旧, 非阻塞)。
+//! - **顺序: 先 `snapshot.put` 后 `bus.publish`** —— 订阅者收到 update 时,
+//!   `GetSnapshot(figi)` 一定能读到至少同一笔。反过来不成立 (snapshot 可能
+//!   领先 bus 一笔), 但那是订阅者还没来得及收到的窗口, 不影响"快照不会落
+//!   后于流"这个对外契约。
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,29 +35,21 @@ pub struct IngestHandle {
 pub struct IngestStats {
     /// 实际成功收到 / 写入 snapshot / 广播的笔数。
     pub received: u64,
-    /// `gateway_seq` 不连续的**事件次数**(每次跳跃 = +1,无论跳几笔)。
+    /// `gateway_seq` 不连续的**事件次数** (每次跳跃 = +1, 无论跳几笔)。
     ///
-    /// 粒度选择 `event count` 是 GUIDELINE §4.2 拍板的(「紀錄一筆 gap event」)。
-    /// 「漏了几笔」「閾值」「復原」属 GUIDELINE §13 TODO,不在 deliverable 范围。
+    /// 粒度选择 "event count" 而非 "缺笔总数":前者足以让运维察觉异常,
+    /// 后者要维护额外滑窗。"漏几笔阈值告警"、"主动 resync 复原"等更精细的
+    /// gap 治理超出本次 deliverable 范围,故意只埋 counter 不做反应。
     pub gaps: u64,
 }
 
 impl IngestHandle {
-    /// 通知 ingest 退出（非阻塞）。可重复调用。
-    ///
-    /// Phase 2 `Service::run` 在 tonic server 退出后 / ctrl-c 触发时调用，
-    /// 对称地处理 EOF 与外部 shutdown。
-    #[allow(dead_code)]
-    pub fn stop(&self) {
-        self.stop.store(true, Ordering::Release);
-    }
-
     /// 取 stop 信号的 `Arc` clone，让 [`Service::run`](crate::Service::run)
-    /// 在 `tokio::select!` 拿走 `IngestHandle` 之后仍能从外部触发 stop。
+    /// 在 `tokio::select!` 拿走 `IngestHandle` 之后仍能从外部触发 stop
+    /// (一律 `.store(true, Release)`)。
     ///
-    /// 直接暴露 `Arc<AtomicBool>`（而非定义 `StopToken` newtype）的理由：
-    /// - service crate 内部使用，不出 crate 边界，无需类型包装。
-    /// - 调用方一律 `.store(true, Release)`，语义即"通知 ingest 退出"。
+    /// 直接暴露 `Arc<AtomicBool>` 而非 `StopToken` newtype:service crate 内部
+    /// 使用, 不出 crate 边界, 类型包装的收益不抵 boilerplate 成本。
     pub fn stop_token(&self) -> Arc<AtomicBool> {
         self.stop.clone()
     }
@@ -84,8 +78,9 @@ impl Drop for IngestHandle {
 
 /// 启动 ingest 线程。
 ///
-/// 走泛型 `U` 而非 `Box<dyn Upstream>`（GUIDELINE D3-A 静态分派）：
-/// `Upstream::receive` 是每秒上千次的热路径，不容忍虚函数开销。
+/// 走泛型 `U` 而非 `Box<dyn Upstream>` (静态分派):`Upstream::receive` 是每秒
+/// 上千次的热路径,不容忍虚函数开销。trade-off:Service 装配处选完上游类型
+/// 后类型即固定,不能在运行时切换;但本服务只在 main 装配一次,无此需求。
 pub fn spawn<U>(
     upstream: U,
     snapshot: Arc<Snapshot>,
@@ -119,7 +114,7 @@ fn ingest_loop<U: Upstream>(
     stop: Arc<AtomicBool>,
 ) -> IngestStats {
     let mut stats = IngestStats::default();
-    // GUIDELINE §4.2: `gateway_seq` 全流嚴格遞增；用作 gap 检测的唯一可靠依据。
+    // upstream 契约:`gateway_seq` 全流严格递增 —— 用作 gap 检测的唯一可靠依据。
     let mut last_seq: Option<u64> = None;
 
     loop {
@@ -138,8 +133,10 @@ fn ingest_loop<U: Upstream>(
                 Ok(Some(book)) => {
                     stats.received += 1;
 
-                    // 考虑过乱序情况，在feed-sim的情况下不会产生错误
-                    // 未来在实际情况下可能会需要调整
+                    // 用 `!=` 而非 `<` 检测 gap:依赖 upstream 单调递增的契约。
+                    // 若未来上游允许乱序到达(例如多 partition 合流),这里要改成
+                    // 维护一个 in-flight set + 收完 N 笔再判 gap, 否则乱序到达
+                    // 也会被误报成 gap。当前 feed-sim 单线程严格递增, 无此问题。
                     if let Some(prev) = last_seq
                         && book.gateway_seq != prev + 1
                     {
@@ -165,7 +162,9 @@ fn ingest_loop<U: Upstream>(
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    // GUIDELINE §6：单条错误不应杀整个服务；log + 跳回外层 wait。
+                    // 单条错误不应杀整个服务;log + 跳回外层 wait, 下一轮 poll
+                    // 重新尝试。若错误是持续性的, 反映为 stderr 噪音 + 0 吞吐,
+                    // 由 operator 决定是否重启。
                     eprintln!("[ingest] receive error: {e:?}");
                     break;
                 }
@@ -217,8 +216,7 @@ mod tests {
         assert_eq!(stats.gaps, 0, "1..=30 has no gaps");
     }
 
-    /// **T3（DEV_PROCESS §5.1）**：守 GUIDELINE §4.2 "gateway_seq 全流嚴格遞增"。
-    ///
+    /// 守 "gateway_seq 不连续 → 累进 gap event" 这一条 ingest_loop 契约。
     /// 注入 seq=1, 2, 5 → ingest_loop 应在 5 处累进一次 `gaps`。
     #[test]
     fn gap_counter_increments_on_skipped_seq() {
@@ -245,10 +243,11 @@ mod tests {
         assert_eq!(stats.gaps, 1, "skipping 3,4 between 2 and 5 = 1 gap event");
     }
 
-    /// 守 ingest 顺序不变量："先 snapshot.put、后 bus.publish"。
+    /// 守 ingest 顺序不变量:"先 snapshot.put、后 bus.publish"。
     ///
-    /// 推一笔 → ingest 结束 → assert snapshot 必含这笔。bus 未必有订阅者，
-    /// 但 snapshot 必须先写好（否则 README §2 取不到最新）。
+    /// 推一笔 → ingest 结束 → assert snapshot 必含这笔。bus 未必有订阅者,
+    /// 但 snapshot 必须先写好 —— 否则订阅者收到 update 后立刻 GetSnapshot 会
+    /// 读到老快照, 破坏 "GetSnapshot 不落后于流" 的对外契约。
     #[test]
     fn snapshot_populated_before_join_returns() {
         let (up, handle_in) = MockUpstream::new();

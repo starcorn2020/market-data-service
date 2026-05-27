@@ -1,23 +1,19 @@
 //! # `marketdata-service`
 //!
-//! Take-home assignment 的核心 crate：接住 [`feed_sim`] 噴出的 `BookMessage` 流，
-//! 对外同时提供 request/response（取最新快照）与 pub/sub（推播即时更新）两种 API。
-//!
-//! 详细设计与不变量见专案根目录的 `AI_DEV_GUILDELINE.md`。
-//!
-//! ## Phase 1 范围
-//!
-//! 本 crate 目前**仅实现 ingest → snapshot → bus 的内部路径**；gRPC server 与
-//! sample client 在 Phase 2 引入。Phase 1 binary 跑起来后可观察 ingest 进度输出，
-//! 验证骨架通畅。
+//! Take-home assignment 的核心 crate:接住 [`feed_sim`] 喷出的 `BookMessage`
+//! 流, 对外同时提供 request/response (取最新快照) 与 pub/sub (推播即时更新)
+//! 两种 API 通过 gRPC 暴露。
 //!
 //! ## 对外 API 形状
 //!
 //! ```ignore
 //! let cfg = ServiceConfig::from_env()?;
 //! let service = Service::new(cfg)?;     // 假设身处 tokio runtime 上下文
-//! service.run().await?;                  // ingest 线程跑到上游排空为止
+//! service.run().await?;                  // 阻塞到 ctrl_c 或上游 EOF
 //! ```
+//!
+//! 整体架构 (ingest → snapshot + bus → gRPC handler) 与设计取舍详见
+//! 各 sub-module 的顶部 doc, 以及 `crates/marketdata-service/README.md`。
 
 #![warn(missing_docs)]
 
@@ -59,13 +55,15 @@ use crate::upstream::FeedSimUpstream;
 
 /// 服务总体生命周期 holder。
 ///
-/// 持有 ingest 线程句柄 + 共享状态（snapshot 表、fan-out bus）+ gRPC 监听地址。
+/// 持有 ingest 线程句柄 + 共享状态 (snapshot 表、fan-out bus) + gRPC 监听
+/// 地址。
 ///
-/// # D6: runtime 主导权外推
+/// # Runtime 主导权外推
 ///
-/// `Service::new` **假设身处 tokio runtime 上下文**（构造 `Bus` 内部不需要 runtime，
-/// 但留出 runtime 给 `tonic::transport::Server::serve` 与 `tokio::spawn`）。
-/// Service crate 本身不写 `#[tokio::main]`，runtime 配置权在 `main.rs` 或调用方。
+/// `Service::new` **假设身处 tokio runtime 上下文** (构造 `Bus` 不需要 runtime,
+/// 但留出 runtime 给 `tonic::transport::Server::serve` 与 `tokio::spawn`)。
+/// service crate 自身不写 `#[tokio::main]`, runtime 配置权留给 `main.rs` 或
+/// 调用方 —— 便于以不同 runtime 配置 (worker 数、scheduler 类型) 复用本 crate。
 ///
 /// # 两个启动入口:`run` vs `start`
 ///
@@ -73,12 +71,12 @@ use crate::upstream::FeedSimUpstream;
 /// |---|---|---|
 /// | 用途 | 生产 binary | 集成测试 |
 /// | 阻塞语义 | `.await` 到 ctrl_c / 自然 EOF 才返回 | 立即返回 [`RunningService`] 句柄 |
-/// | `listen_addr` 用法 | 通常 `0.0.0.0:50051` | 通常 `127.0.0.1:0`(OS 分配动态 port) |
+/// | `listen_addr` 用法 | 通常 `0.0.0.0:50051` | 通常 `127.0.0.1:0` (OS 分配动态 port) |
 /// | Shutdown 触发 | ctrl_c 信号 / ingest 自然 EOF | [`RunningService::shutdown`] 显式调用 |
-/// | 错误返回 | 直接走 `Result<(), BoxError>` | 推给 background server task,`shutdown().await` 时收 |
+/// | 错误返回 | 直接走 `Result<(), BoxError>` | 推给 background server task, `shutdown().await` 时收 |
 ///
-/// 二者共用 `Service::new*` 入口,所以构造副作用(`mds-ingest` std::thread 已 spawn)
-/// 是一致的;差别只在 server 生命周期管理。
+/// 二者共用 `Service::new*` 入口, 所以构造副作用 (`mds-ingest` std::thread 已
+/// spawn) 是一致的;差别只在 server 生命周期管理。
 pub struct Service {
     snapshot: Arc<Snapshot>,
     bus: Arc<Bus>,
@@ -115,19 +113,20 @@ impl Service {
         Self::new_with_upstream(cfg, upstream)
     }
 
-    /// 测试 / 自定义上游入口：注入任意 [`Upstream`] 实作。
+    /// 测试 / 自定义上游入口:注入任意 [`Upstream`] 实作。
     ///
-    /// 与 [`Service::new`] 的区别：不构造 `FeedSimUpstream`，让调用方控制
-    /// 上游的速率与终止时机。Phase 3 集成测试用 [`MockUpstream`] 走这条路径,
-    /// 避免真 feed-sim 背景执行緒的不确定性。
+    /// 与 [`Service::new`] 的区别:不构造 `FeedSimUpstream`, 让调用方控制
+    /// 上游的速率与终止时机。集成测试用 [`MockUpstream`] 走这条路径, 避免
+    /// 真 feed-sim 背景执行緒的不确定性。
     ///
-    /// 走泛型 `<U: Upstream + 'static>` 而非 `Box<dyn Upstream>`：见
-    /// `upstream/mod.rs` 文档对静态分派的解释（D3 决策）。
+    /// 走泛型 `<U: Upstream + 'static>` 而非 `Box<dyn Upstream>` (静态分派):
+    /// `Upstream::receive` 是 hot path, 不容忍虚函数开销。详见
+    /// `upstream/mod.rs` 顶部 doc。
     ///
     /// # 副作用
     ///
-    /// 与 [`Service::new`] 相同:**立即** spawn 一条名为 `mds-ingest` 的 std::thread
-    /// (`ingest::spawn` 内部),从此 ingest 开始 drain upstream。
+    /// 与 [`Service::new`] 相同:**立即** spawn 一条名为 `mds-ingest` 的
+    /// `std::thread` (`ingest::spawn` 内部), 从此 ingest 开始 drain upstream。
     /// `Service` drop 时由 `IngestHandle::Drop` 兜底 stop + join。
     pub fn new_with_upstream<U: Upstream + 'static>(
         cfg: ServiceConfig,
@@ -189,9 +188,9 @@ impl Service {
         let addr = self.listen_addr;
         eprintln!("[server] listening on {addr}");
 
-        // Ingest join 必须放进 blocking pool —— ingest 是 std::thread，
-        // 其 JoinHandle::join 是同步阻塞调用（参考 GUIDELINE §7.1）。
-        // 通过 `flume`-less 拆法：clone stop signal 给上面用，spawn_blocking 等结束。
+        // Ingest join 必须放进 blocking pool —— ingest 是 std::thread, 其
+        // `JoinHandle::join` 是同步阻塞调用, 不能直接 await。
+        // 拆法:clone stop signal 给上面 select! 用, spawn_blocking 等结束。
         let stop_token = ingest_handle.stop_token();
         let ingest_join = tokio::task::spawn_blocking(move || ingest_handle.join());
 
@@ -211,13 +210,13 @@ impl Service {
             });
 
         tokio::select! {
-            // 路径 3：ingest 自然 EOF（finite stream / max_messages 跑完）。
+            // 路径 3:ingest 自然 EOF (finite stream / max_messages 跑完)。
             //
-            // 当前**不**等 serve_fut 退出 —— Phase 2 deliverable 重点是 demo 跑通,
-            // ingest EOF 后立即返回 → main 函数返回 → process exit → runtime drop
-            // 把 serve task abort。代价:任何还在 stream 的 client 收到 broken
-            // transport (HTTP/2 RST_STREAM),不是 graceful FIN。Demo / 测试可接受。
-            // Production 严格场景应通过上方注释里的 shared shutdown channel 重构。
+            // 当前**不**等 serve_fut 退出:ingest EOF 后立即返回 → main 函数
+            // 返回 → process exit → runtime drop 把 serve task abort。代价:
+            // 任何还在 stream 的 client 收到 broken transport (HTTP/2
+            // RST_STREAM), 不是 graceful FIN。Demo / 测试场景可接受;production
+            // 严格场景应通过上方注释里的 shared shutdown channel 重构。
             join_res = ingest_join => {
                 let stats = join_res
                     .map_err(|e| -> BoxError { format!("ingest join task panicked: {e}").into() })?;
@@ -232,19 +231,21 @@ impl Service {
                 );
                 Ok(())
             }
-            // 路径 1 + 2：tonic serve 退出(ctrl_c 触发 graceful shutdown,或 serve
-            //              自身错误如端口冲突)。set stop_token 通知 ingest 退出。
+            // 路径 1 + 2:tonic serve 退出 (ctrl_c 触发 graceful shutdown, 或
+            //              serve 自身错误如端口冲突)。set stop_token 通知 ingest
+            //              退出。
             //
-            // **不等 `ingest_join.await`**:`ingest_join` 在 select! 中被 move 进 future,
-            // 这条臂 fire 时 ingest_join future 被 drop,**但 spawn_blocking 内部的
-            // closure 仍会跑完**(spawn_blocking 不可 abort)。所以 `ingest_handle.join()`
-            // 仍会被调用,只是其返回的 `IngestStats` 我们拿不到。代价:
-            //   - log 顺序可能乱:`[server] shut down gracefully` 先打,`[ingest] stopped`
-            //     稍后打(由 ingest_loop 自己 print)。可接受。
-            //   - 拿不到 final stats:已经走过的 `[ingest] stopped: received=N` log 仍是
-            //     reviewer 验证 demo 跑通的锚点,Service 层不重复打。
+            // **不等 `ingest_join.await`**:`ingest_join` 在 select! 中被 move 进
+            // future, 这条臂 fire 时 ingest_join future 被 drop, **但
+            // spawn_blocking 内部的 closure 仍会跑完** (spawn_blocking 不可
+            // abort)。所以 `ingest_handle.join()` 仍会被调用, 只是返回的
+            // `IngestStats` 我们拿不到。代价:
+            //   - log 顺序可能乱:`[server] shut down gracefully` 先打,
+            //     `[ingest] stopped` 稍后打 (由 ingest_loop 自己 print)。可接受。
+            //   - 拿不到 final stats:`[ingest] stopped: received=N` log 仍能在
+            //     stderr 看到, service 层不重复打。
             // 修正需要 `tokio::pin!(ingest_join)` + select! 用 `&mut ingest_join`,
-            // 收益 / 成本不匹配,本次刻意不做。
+            // 收益与代价不匹配, 保持当前简化路径。
             serve_res = serve_fut => {
                 stop_token.store(true, std::sync::atomic::Ordering::Release);
                 serve_res.map_err(|e| -> BoxError { format!("tonic serve failed: {e}").into() })?;
@@ -393,14 +394,14 @@ impl Drop for RunningService {
 mod tests {
     //! `Service` 构造期的早 fail-fast 行为守护。
     //!
-    //! `run` / `start` 的运行时行为由 `tests/grpc_basic.rs` integration 测试覆盖
-    //! (NotYet/Found / Subscribe 推流 / 空 figi 拒绝 / too-long figi 拒绝);本档
-    //! 只守**构造路径的 validate 优先级**(L5,DEV_PROCESS §6.9):无效 cfg 必须
-    //! **早**于昂贵副作用(spawn `mds-ingest` std::thread)被拒绝,避免无效 cfg
-    //! 触发 thread spawn 后才 fail 的丑路径。
+    //! `run` / `start` 的运行时行为由 `tests/grpc_basic.rs` integration 测试
+    //! 覆盖 (NotYet/Found / Subscribe 推流 / 空 figi 拒绝 / too-long figi
+    //! 拒绝);本档只守**构造路径的 validate 优先级**:无效 cfg 必须**早**于
+    //! 昂贵副作用 (spawn `mds-ingest` std::thread) 被拒绝, 避免"无效 cfg
+    //! 已经 spawn thread 后才 fail" 的丑路径。
     //!
-    //! 不在本档加 `run` / `start` 的 unit test:二者本质上需要 mock 上游 + 真实
-    //! tonic server,等于重写 integration 流程,重复成本高。
+    //! 不在本档加 `run` / `start` 的 unit test:二者本质上需要 mock 上游 +
+    //! 真实 tonic server, 等于重写 integration 流程, 重复成本高。
 
     use super::*;
     use crate::upstream::MockUpstream;
@@ -412,13 +413,13 @@ mod tests {
         }
     }
 
-    /// 守 L5(DEV_PROCESS §6.9):无效 cfg 在 `new_with_upstream` 入口被
-    /// `cfg.validate()?` 短路 reject,**根本不**走到 `ingest::spawn`。
+    /// 守 "无效 cfg 在 spawn thread 之前被拒绝":`new_with_upstream` 入口的
+    /// `cfg.validate()?` 短路 reject, **根本不**走到 `ingest::spawn`。
     ///
-    /// 间接证明:若 validate 通过, `spawn` 会创一条 `mds-ingest` 线程并立即开始
-    /// drain MockUpstream;本测试构造的 `MockUpstream` 没 push 任何 book 也没 close,
-    /// 若 ingest 真启动会进入 wait/poll 循环,但**因为 validate 失败,这条路径
-    /// 不会被触发**,函数立刻返回 Err。
+    /// 间接证明:若 validate 通过, `spawn` 会创一条 `mds-ingest` 线程并立即
+    /// 开始 drain MockUpstream;本测试构造的 `MockUpstream` 没 push 任何 book
+    /// 也没 close, 若 ingest 真启动会进入 wait/poll 循环, 但**因为 validate
+    /// 失败, 这条路径不会被触发**, 函数立刻返回 Err。
     #[tokio::test(flavor = "current_thread")]
     async fn new_with_upstream_rejects_invalid_config_early() {
         let (up, _handle) = MockUpstream::new();

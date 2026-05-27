@@ -1,90 +1,61 @@
-//! Sample gRPC client (README §6).
+//! Sample gRPC client —— 题面要求的 "end-to-end 演示两条 API"。
 //!
 //! Demos both APIs end-to-end:
 //!
-//! 1. `GetSnapshot(figi)` → prints `Found(...)` or `NotYet`.
-//! 2. `Subscribe([figi…])` → counts updates for N seconds, prints final
-//!    `dropped_total` so reviewer can see GUIDELINE §4.3.3 lag mechanism live.
+//! 1. `GetSnapshot(figi)` → prints `Found(seq, bids, asks)` 或 `NotYet`。
+//! 2. `Subscribe([figi…])` → 按时长收 N 秒推流, 结束时打印 `received` 与
+//!    `dropped_total`, 让 reviewer 直接观察 slow-consumer lag 机制是否生效
+//!    (注:若 client 跟得上节奏, `dropped_total` 可能始终为 0; 想看到非 0,
+//!    可临时把 server 的 `MDS_SUBSCRIBER_QUEUE` 设小或 `SIM_RATE_HZ` 调高)。
 //!
-//! Env vars:
+//! # Verbose 模式（强烈建议第一次跑就打开）
+//!
+//! 默认输出只有计数 / seq / figi 这种摘要行，**看不到 bids/asks 的实际
+//! price / qty / orders**。打开 `MDS_CLIENT_VERBOSE` 后会额外 dump 三处
+//! 完整 proto 结构（`{:#?}` pretty print）：
+//!
+//! - **GetSnapshot 命中时**：完整 `Book`，含全部 5 档 `PriceLevel`。
+//! - **Subscribe 第一笔 `BookUpdate`**：看 wire payload 的真实形态
+//!   （含 `dropped_total`、`book` 字段、`PriceLevel.orders` 列表等）。
+//! - **Subscribe 最后一笔 `BookUpdate`**：让你对比首末两笔的差异
+//!   （seq 推进、levels 变化）。
+//!
+//! 这是 demo client 唯一能直接看到「订单簿在 wire 上长什么样」的入口；
+//! 调试新 reviewer / 验证 schema / 排查 proto 字段缺漏时几乎一定要开。
+//! 默认关闭只是为了让 happy-path 输出保持精简、不刷屏。
+//!
+//! # Env vars
 //!
 //! | Env | Default | Purpose |
 //! |---|---|---|
-//! | `MDS_CLIENT_TARGET`  | `http://127.0.0.1:50051` | Server endpoint (use LAN IP for remote demo) |
-//! | `MDS_CLIENT_FIGI`    | `BBG000000001`           | FIGI to query / subscribe |
+//! | `MDS_CLIENT_TARGET`  | `http://127.0.0.1:50051`    | Server endpoint（局域网 demo 换成 `http://<LAN-IP>:50051`） |
+//! | `MDS_CLIENT_FIGI`    | `BBG000000001`              | FIGI to query / subscribe |
 //! | `MDS_CLIENT_FIGIS`   | (same as `MDS_CLIENT_FIGI`) | Comma-separated FIGI list for Subscribe |
-//! | `MDS_CLIENT_SECS`    | `3`                      | Subscribe duration |
-//! | `MDS_CLIENT_VERBOSE` | (unset)                  | If set (任意非空值), pretty-print 完整 `Book` / `BookUpdate` proto 结构 —— GetSnapshot 结果 + Subscribe 第一笔。用于查看 bids/asks levels 的 price/qty/orders 实际形态。默认关闭,输出保持简洁。 |
+//! | `MDS_CLIENT_SECS`    | `3`                         | Subscribe duration (seconds) |
+//! | `MDS_CLIENT_VERBOSE` | (unset)                     | **设为任意非空值**即开启 verbose dump（见上节）。注意 `MDS_CLIENT_VERBOSE=0` 也算开（用的是 `var().is_ok()`）。 |
 //!
-//! 跨主机 demo:
+//! # Usage (PowerShell)
 //!
-//! ```sh
-//! # Server (host A)
-//! MDS_LISTEN=0.0.0.0:50051 SIM_INSTRUMENTS=10 cargo run -p marketdata-service
+//! ```powershell
+//! # 最简：全部默认，仅摘要输出。
+//! cargo run -p marketdata-service --bin client --release
 //!
-//! # Client (host B on same LAN)
-//! MDS_CLIENT_TARGET=http://<host-a-ip>:50051 cargo run --bin client
+//! # 推荐：开 verbose，看完整 Book/BookUpdate 结构。
+//! $env:MDS_CLIENT_VERBOSE = "1"
+//! cargo run -p marketdata-service --bin client --release
+//!
+//! # 多 FIGI + 跑久一点，方便观察 dropped_total。
+//! $env:MDS_CLIENT_FIGIS = "BBG000000001,BBG000000002"
+//! $env:MDS_CLIENT_SECS  = "10"
+//! cargo run -p marketdata-service --bin client --release
 //! ```
-//!
-//! # 预期输出(reviewer 验收锚点)
-//!
-//! 跑默认参数(`SIM_INSTRUMENTS=10 SIM_RATE_HZ=1000` server + 3s subscribe)时,
-//! stderr 大致如下:
-//!
-//! ```text
-//! [client] connecting to http://127.0.0.1:50051
-//! [client] GetSnapshot(BBG000000001) -> Found(seq=5921, bids=5, asks=5)
-//! [client] Subscribe(["BBG000000001"]) for 3s ...
-//! [client] recv #50 dropped_total=0 (seq=6010 figi=BBG000000001)
-//! [client] recv #100 dropped_total=0 ...
-//! [client] subscribe finished: received=178 dropped_total=0
-//! ```
-//!
-//! 关键观察点(对应不变量验证):
-//! - `Found(...)` 而非 `NotYet`:server 启动后 ingest 已经热身(GUIDELINE §4.2
-//!   「先 put snapshot 后 publish」+ `Service::new` 立即 spawn ingest 顺序)。
-//! - `dropped_total=0`:正常网速 / 单 client / 默认速率下不应有丢失。**若出现 >0
-//!   而非递增**,wire 路径 mpsc 满或 broadcast lagged —— 调高 `MDS_BUS_CAPACITY` /
-//!   `MDS_SUBSCRIBER_QUEUE`。
-//! - `received` 取决于 server 速率与持续秒数(默认 1000 msg/s × N FIGI 平均 →
-//!   ≈ `MDS_CLIENT_SECS × RATE_PER_FIGI`)。
-//!
-//! # Verbose 模式(`MDS_CLIENT_VERBOSE=1`)
-//!
-//! 想看 wire payload 的实际形态(每档 bid/ask 的 price/qty/orders / proto 字段排布):
-//!
-//! ```sh
-//! MDS_CLIENT_VERBOSE=1 cargo run --bin client
-//! ```
-//!
-//! 额外输出(节选):
-//!
-//! ```text
-//! [client] GetSnapshot(BBG000000001) -> Found:
-//! Book {
-//!     figi: "BBG000000001",
-//!     gateway_seq: 5411,
-//!     gateway_ts: 1763890234567890123,
-//!     bids: [
-//!         Level { price: 100.05, qty: 1.5, orders: 3 },
-//!         Level { price: 100.02, qty: 2.1, orders: 5 },
-//!         ...
-//!     ],
-//!     asks: [ ... ],
-//! }
-//! [client] first BookUpdate:
-//! BookUpdate { book: Some(Book { ... }), dropped_total: 0 }
-//! ```
-//!
-//! Verbose 只 dump 一次性的 sample(GetSnapshot 结果 + Subscribe 第一笔),
-//! 不影响后续 50 笔节流的简洁输出 —— 避免 stdout 爆炸但仍能让 reviewer 一眼
-//! 看清资料形态。
+
 
 use std::time::{Duration, Instant};
 
 use marketdata_service::BoxError;
 use marketdata_service::pb::{
-    GetSnapshotRequest, SubscribeRequest, market_data_client::MarketDataClient,
+    BookUpdate, GetSnapshotRequest, SubscribeRequest, market_data_client::MarketDataClient,
     snapshot_response::Result as SnapResult,
 };
 
@@ -101,8 +72,6 @@ async fn main() -> Result<(), BoxError> {
     let verbose = std::env::var("MDS_CLIENT_VERBOSE").is_ok();
 
     eprintln!("[client] connecting to {target}");
-    // `MarketDataClient::connect<D: TryInto<Endpoint>>` 直接接 owned `String`,
-    // 无需 clone(target 之后不再使用)。
     let mut client = MarketDataClient::connect(target).await?;
 
     // ---- demo 1: unary GetSnapshot ----
@@ -147,6 +116,8 @@ async fn main() -> Result<(), BoxError> {
     let deadline = Instant::now() + Duration::from_secs(secs);
     let mut received: u64 = 0;
     let mut final_dropped: u64 = 0;
+    // 保留最后一笔 BookUpdate，供 loop 结束后 verbose dump。
+    let mut last_upd: Option<BookUpdate> = None;
 
     // tonic streaming::next() 来自 futures_core::Stream，via prelude.
     use tokio_stream::StreamExt as _;
@@ -173,6 +144,7 @@ async fn main() -> Result<(), BoxError> {
                         upd.book.as_ref().map(|b| b.figi.as_str()).unwrap_or("?"),
                     );
                 }
+                last_upd = Some(upd);
             }
             Ok(Some(Err(status))) => {
                 return Err(format!("stream error: {status:?}").into());
@@ -182,6 +154,14 @@ async fn main() -> Result<(), BoxError> {
                 break;
             }
             Err(_) => break, // timeout reached
+        }
+    }
+
+    // 把最后一笔 BookUpdate 完整 dump 出来（verbose 才打）。
+    if verbose {
+        match &last_upd {
+            Some(upd) => eprintln!("[client] final BookUpdate:\n{upd:#?}"),
+            None => eprintln!("[client] final BookUpdate: <none received>"),
         }
     }
 

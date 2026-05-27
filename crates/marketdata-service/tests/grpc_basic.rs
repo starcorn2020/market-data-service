@@ -1,6 +1,11 @@
 //! gRPC 基础路径冒烟测试。
 //!
-//! 守 README §2 / §3 的"最新快照" + "clearly-defined no data yet" 契约。
+//! 在真实 tonic server + client + `MockUpstream` 上端到端守:
+//!
+//! - **"per-instrument latest-book snapshot"** 契约 (题面 §2):
+//!   `not_yet_then_found` / `snapshot_returns_latest_seq`。
+//! - **"clearly-defined no data yet"** 契约 (题面 §3):同上。
+//! - **`Subscribe` 推流** + figi 长度校验 (`grpc.rs` wire 防御层)。
 
 mod common;
 
@@ -11,10 +16,9 @@ use marketdata_service::make_book;
 use marketdata_service::pb::{GetSnapshotRequest, SubscribeRequest, snapshot_response::Result as SnapResult};
 use tokio_stream::StreamExt;
 
-/// **T4（DEV_PROCESS §5.1）**：守 README §3 "clearly-defined no data yet"。
-///
-/// 启动 service 后 **不推任何数据**，立刻 GetSnapshot → 必须返 `NotYet`。
-/// 然后推一笔 → 再 GetSnapshot → 必须返 `Found` 且 seq 匹配。
+/// 守 "clearly-defined no data yet" 契约:启动 service 后**不推任何数据**,
+/// 立刻 GetSnapshot → 必须返 `NotYet`。然后推一笔 → 再 GetSnapshot → 必须返
+/// `Found` 且 seq 匹配。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn not_yet_then_found() -> Result<(), BoxError> {
     let (running, mock) = common::spawn_default_service().await?;
@@ -56,8 +60,8 @@ async fn not_yet_then_found() -> Result<(), BoxError> {
     Ok(())
 }
 
-/// 守 README §2 "per-instrument latest-book snapshot"：
-/// 同 FIGI 连续推多笔递增 seq 后，GetSnapshot 必须返回**最大** seq。
+/// 守 "per-instrument latest-book snapshot" 契约:同 FIGI 连续推多笔递增 seq
+/// 后, GetSnapshot 必须返回**最大** seq。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn snapshot_returns_latest_seq() -> Result<(), BoxError> {
     let (running, mock) = common::spawn_default_service().await?;
@@ -135,9 +139,9 @@ async fn subscribe_empty_figis_rejected() -> Result<(), BoxError> {
     Ok(())
 }
 
-/// 守 grpc.rs `get_snapshot` 的显式长度校验:Figi::from_str 本身是 Infallible
-/// (GUIDELINE §2.1 silently 截断),wire 层在 parse 前主动拒绝过长 figi,避免
-/// 客户端送 "BBG_LONG_FIGI" 被切成前 12 byte 后大概率返 NotYet 的诡异 UX。
+/// 守 `grpc.rs::get_snapshot` 的 figi 长度校验:`Figi::from_str` 本身是
+/// Infallible (silently 截断), wire 层在 parse 前主动拒绝过长 figi, 避免
+/// 客户端送 `"BBG_LONG_FIGI"` 被切成前 12 byte 后大概率返 `NotYet` 的诡异 UX。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn get_snapshot_too_long_figi_rejected() -> Result<(), BoxError> {
     let (running, mock) = common::spawn_default_service().await?;

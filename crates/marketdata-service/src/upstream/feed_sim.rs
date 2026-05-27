@@ -1,7 +1,3 @@
-//! `feed_sim::FeedSubscriber` 的 [`Upstream`] adapter。
-//!
-//! 整个 service crate 里**唯一** `use feed_sim::*` 的文件，是 I4 不变量的密封点。
-
 use std::time::Duration;
 
 use feed_sim::{FeedSubscriber, SubscriberConfig};
@@ -12,11 +8,9 @@ use crate::config::UpstreamConfig;
 
 use super::Upstream;
 
-/// `feed_sim::FeedSubscriber` 的 newtype 包装。
-///
-/// 注意 `FeedSubscriber` 是 `!Sync`（内部持有 `std::sync::mpsc::Receiver`），
-/// 因此 `FeedSimUpstream` 也是 `!Sync`，**只能由单一线程独占**——这正好契合
-/// GUIDELINE §3.5 的"整个 service 只能有一个 ingest 点呼叫 receive"。
+/// 真实 (默认) [`Upstream`] 实作 —— 包 [`FeedSubscriber`], 把 `feed_sim` 类型
+/// 封死在本档内。换上游 (例如真实 iceoryx2) 时, 仅需新增同级 `iceoryx2.rs`
+/// 实现 [`Upstream`] trait, ingest / service 装配端 0 改动。
 pub struct FeedSimUpstream {
     inner: FeedSubscriber,
 }
@@ -35,8 +29,9 @@ impl FeedSimUpstream {
 impl Upstream for FeedSimUpstream {
     fn receive(&self) -> Result<Option<BookMessage>, BoxError> {
         match self.inner.receive() {
-            // FeedSample 在此处 deref 然后值拷贝（408 bytes / Copy）。
-            // 跨线程传递必须传值，引用会被 sample 生命周期绑住。
+            // `FeedSample` 在此处 deref 后值拷贝 (~408 bytes, `Copy`)。跨线程
+            // 传递必须传值 —— 引用会被 sample 生命周期绑住, 无法跨 ingest /
+            // service 边界。值拷贝在 1k msg/s 默认速率下 ~ 408 KB/s, 无瓶颈。
             Ok(Some(sample)) => Ok(Some(*sample)),
             Ok(None) => Ok(None),
             Err(e) => Err(format!("feed-sim receive failed: {e:?}").into()),

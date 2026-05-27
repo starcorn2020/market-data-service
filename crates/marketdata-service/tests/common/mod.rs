@@ -1,15 +1,15 @@
-//! Phase 3 集成测试共享 helper。
+//! 集成测试共享 helper。
 //!
-//! 每个 `tests/*.rs` 文件被 cargo 当作独立的测试二进制；本文件作为模块
-//! 通过 `mod common;` 被各测试包含，避免重复样板。
+//! 每个 `tests/*.rs` 文件被 cargo 当作独立的测试二进制;本文件通过
+//! `mod common;` 被各测试包含, 避免重复样板。
 //!
 //! # 设计原则
 //!
-//! - **完全确定性**：上游用 `MockUpstream`，由测试代码控制每一笔何时进入
-//!   ingest，避免 feed-sim 背景线程带来的不确定时序。
-//! - **动态端口**：`listen_addr = 127.0.0.1:0`，OS 分配端口，测试并行无冲突。
-//! - **显式 shutdown**：`RunningService::shutdown()` 必须 await，否则 ingest
-//!   std::thread 可能在 runtime drop 之后才回收，引发 cleanup race。
+//! - **完全确定性**:上游用 `MockUpstream`, 由测试代码控制每一笔何时进入
+//!   ingest, 避免 feed-sim 背景线程带来的不确定时序。
+//! - **动态端口**:`listen_addr = 127.0.0.1:0`, OS 分配端口, 测试并行无冲突。
+//! - **显式 shutdown**:`RunningService::shutdown()` 必须 await, 否则 ingest
+//!   `std::thread` 可能在 runtime drop 之后才回收, 引发 cleanup race。
 
 #![allow(dead_code)] // 不同测试文件用不同 helper，未使用的不报警。
 
@@ -21,14 +21,15 @@ use marketdata_service::{
 };
 use tonic::transport::Channel;
 
-/// 默认测试 config：listen 127.0.0.1:0、低延迟 poll、小容量便于触发边界。
+/// 默认测试 config:listen `127.0.0.1:0`、低延迟 poll、小容量便于触发边界。
 ///
-/// # 容量选择(64 / 32)
+/// # 容量选择 (64 / 32)
 ///
-/// 远小于 production default(1024 / 1024)。当前 `tests/grpc_basic.rs` 都是
-/// 低速场景(几笔 push),不会触发 capacity 边界 → 与 default 等价;**保留小容量
-/// 是为未来添加 wire-level 边界测试时不需要再换 config**(对比 §6.2 的 wire
-/// slow-consumer 走自定义大流量配置 + `#[ignore]`)。
+/// 远小于 production default (1024 / 1024)。`grpc_basic.rs` 都是低速场景
+/// (几笔 push), 不会触发 capacity 边界 → 与 default 等价;**保留小容量**
+/// 是为未来添加 wire-level 边界测试时不需要再换 config。
+/// `grpc_slow_consumer.rs` 走自定义更激进的配置 (overrides `bus_channel_capacity`
+/// / `subscriber_queue_size`)。
 pub fn test_config() -> ServiceConfig {
     ServiceConfig {
         upstream: UpstreamConfig::default(), // 不会用到（MockUpstream 走 new_with_upstream）
