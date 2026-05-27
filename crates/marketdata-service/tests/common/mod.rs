@@ -1,17 +1,21 @@
-//! 集成测试共享 helper。
+//! Shared helpers for integration tests.
 //!
-//! 每个 `tests/*.rs` 文件被 cargo 当作独立的测试二进制;本文件通过
-//! `mod common;` 被各测试包含, 避免重复样板。
+//! Each `tests/*.rs` file is compiled by cargo as an independent test
+//! binary; this file is pulled in by each test via `mod common;` to avoid
+//! boilerplate duplication.
 //!
-//! # 设计原则
+//! # Design principles
 //!
-//! - **完全确定性**:上游用 `MockUpstream`, 由测试代码控制每一笔何时进入
-//!   ingest, 避免 feed-sim 背景线程带来的不确定时序。
-//! - **动态端口**:`listen_addr = 127.0.0.1:0`, OS 分配端口, 测试并行无冲突。
-//! - **显式 shutdown**:`RunningService::shutdown()` 必须 await, 否则 ingest
-//!   `std::thread` 可能在 runtime drop 之后才回收, 引发 cleanup race。
+//! - **Fully deterministic**: the upstream is `MockUpstream`; the test
+//!   code controls exactly when each message enters ingest, avoiding the
+//!   nondeterministic timing of feed-sim's background thread.
+//! - **Dynamic port**: `listen_addr = 127.0.0.1:0`; the OS assigns a
+//!   port, so tests run in parallel without conflicts.
+//! - **Explicit shutdown**: `RunningService::shutdown()` must be awaited,
+//!   otherwise the ingest `std::thread` may not be reaped until after
+//!   the runtime is dropped, triggering a cleanup race.
 
-#![allow(dead_code)] // 不同测试文件用不同 helper，未使用的不报警。
+#![allow(dead_code)] // Different test files use different helpers; suppress warnings on unused ones.
 
 use std::time::Duration;
 
@@ -21,32 +25,36 @@ use marketdata_service::{
 };
 use tonic::transport::Channel;
 
-/// 默认测试 config:listen `127.0.0.1:0`、低延迟 poll、小容量便于触发边界。
+/// Default test config: listen on `127.0.0.1:0`, low-latency poll, small
+/// capacities to make boundary cases easy to trigger.
 ///
-/// # 容量选择 (64 / 32)
+/// # Capacity choice (64 / 32)
 ///
-/// 远小于 production default (1024 / 1024)。`grpc_basic.rs` 都是低速场景
-/// (几笔 push), 不会触发 capacity 边界 → 与 default 等价;**保留小容量**
-/// 是为未来添加 wire-level 边界测试时不需要再换 config。
-/// `grpc_slow_consumer.rs` 走自定义更激进的配置 (overrides `bus_channel_capacity`
-/// / `subscriber_queue_size`)。
+/// Much smaller than the production default (1024 / 1024).
+/// `grpc_basic.rs` is a low-rate scenario (a handful of pushes) and does
+/// not hit capacity boundaries → equivalent to defaults; **the small
+/// capacity is kept** so future wire-level boundary tests do not need a
+/// new config. `grpc_slow_consumer.rs` uses a more aggressive custom
+/// config (overrides `bus_channel_capacity` / `subscriber_queue_size`).
 pub fn test_config() -> ServiceConfig {
     ServiceConfig {
-        upstream: UpstreamConfig::default(), // 不会用到（MockUpstream 走 new_with_upstream）
+        upstream: UpstreamConfig::default(), // Unused (MockUpstream goes through new_with_upstream).
         poll_interval: Duration::from_millis(5),
         bus_channel_capacity: 64,
         subscriber_queue_size: 32,
-        progress_log_every: 0, // 测试期间禁用进度 log
+        progress_log_every: 0, // Disable progress logs during tests.
         listen_addr: "127.0.0.1:0".parse().expect("hardcoded addr valid"),
     }
 }
 
-/// 启动一个用 [`MockUpstream`] 驱动的测试 Service。
+/// Start a test Service driven by a [`MockUpstream`].
 ///
-/// 返回 `(running, mock_handle)`：
-/// - `running.addr()` 是实际监听地址（OS 分配）。
-/// - `mock_handle.push(book)` 注入消息；`mock_handle.close()` 让 ingest 自然结束。
-/// - 测试结束前**必须** `running.shutdown().await` 防止线程泄漏。
+/// Returns `(running, mock_handle)`:
+/// - `running.addr()` is the actual listen address (OS-assigned).
+/// - `mock_handle.push(book)` injects a message;
+///   `mock_handle.close()` lets ingest reach natural EOF.
+/// - The test **must** call `running.shutdown().await` before exiting to
+///   prevent thread leaks.
 pub async fn spawn_service(
     cfg: ServiceConfig,
 ) -> Result<(RunningService, MockHandle), BoxError> {
@@ -56,15 +64,15 @@ pub async fn spawn_service(
     Ok((running, handle))
 }
 
-/// 启动 + 用默认 config（适合大部分测试）。
+/// Start with the default config (suitable for most tests).
 pub async fn spawn_default_service() -> Result<(RunningService, MockHandle), BoxError> {
     spawn_service(test_config()).await
 }
 
-/// 用 server 的实际地址构造一个 gRPC client。
+/// Build a gRPC client targeting the server's actual address.
 ///
-/// `tonic::transport::Channel::from_shared` 接受 `String` URL，
-/// 这里组装 `http://127.0.0.1:<port>`。
+/// `tonic::transport::Channel::from_shared` accepts a `String` URL; we
+/// assemble `http://127.0.0.1:<port>` here.
 pub async fn make_client(
     addr: std::net::SocketAddr,
 ) -> Result<MarketDataClient<Channel>, BoxError> {
@@ -76,10 +84,12 @@ pub async fn make_client(
     Ok(MarketDataClient::new(channel))
 }
 
-/// 等到 ingest 把 `mock_handle.push` 进去的数据 drain 到 snapshot 表。
+/// Wait until ingest has drained the messages pushed via `mock_handle`
+/// into the snapshot table.
 ///
-/// 拒绝 `sleep` 黑魔法 —— 主动轮询 `running.snapshot_len()` 直到达到目标，
-/// 或超时 panic（让 CI 失败显式而非沉默 flake）。
+/// Refuses `sleep`-based magic — actively polls `running.snapshot_len()`
+/// until it reaches the target, otherwise panics on timeout (so CI fails
+/// explicitly rather than silently flaking).
 pub async fn wait_for_snapshot_len(
     running: &RunningService,
     target: usize,

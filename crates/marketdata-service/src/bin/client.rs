@@ -1,50 +1,58 @@
-//! Sample gRPC client —— 题面要求的 "end-to-end 演示两条 API"。
+//! Sample gRPC client — the "end-to-end demo of both APIs" required by the assignment.
 //!
 //! Demos both APIs end-to-end:
 //!
-//! 1. `GetSnapshot(figi)` → prints `Found(seq, bids, asks)` 或 `NotYet`。
-//! 2. `Subscribe([figi…])` → 按时长收 N 秒推流, 结束时打印 `received` 与
-//!    `dropped_total`, 让 reviewer 直接观察 slow-consumer lag 机制是否生效
-//!    (注:若 client 跟得上节奏, `dropped_total` 可能始终为 0; 想看到非 0,
-//!    可临时把 server 的 `MDS_SUBSCRIBER_QUEUE` 设小或 `SIM_RATE_HZ` 调高)。
+//! 1. `GetSnapshots([figi…])` → prints one `Found(seq, bids, asks)` /
+//!    `NotYet` line per requested FIGI.
+//! 2. `Subscribe([figi…])` → receives the push stream for N seconds and on
+//!    exit prints `received` and `dropped_total`, letting the reviewer
+//!    directly observe whether the slow-consumer lag mechanism is engaged
+//!    (note: if the client keeps up with the rate, `dropped_total` may stay
+//!    at 0; to see a non-zero value, temporarily lower the server's
+//!    `MDS_SUBSCRIBER_QUEUE` or raise `SIM_RATE_HZ`).
 //!
-//! # Verbose 模式（强烈建议第一次跑就打开）
+//! # Verbose mode (highly recommended for the first run)
 //!
-//! 默认输出只有计数 / seq / figi 这种摘要行，**看不到 bids/asks 的实际
-//! price / qty / orders**。打开 `MDS_CLIENT_VERBOSE` 后会额外 dump 三处
-//! 完整 proto 结构（`{:#?}` pretty print）：
+//! The default output only shows summary lines (counts / seq / figi); it
+//! **does not show the actual price / qty / orders inside bids/asks**.
+//! Setting `MDS_CLIENT_VERBOSE` additionally dumps the full proto structure
+//! in three places (pretty-printed with `{:#?}`):
 //!
-//! - **GetSnapshot 命中时**：完整 `Book`，含全部 5 档 `PriceLevel`。
-//! - **Subscribe 第一笔 `BookUpdate`**：看 wire payload 的真实形态
-//!   （含 `dropped_total`、`book` 字段、`PriceLevel.orders` 列表等）。
-//! - **Subscribe 最后一笔 `BookUpdate`**：让你对比首末两笔的差异
-//!   （seq 推进、levels 变化）。
+//! - **Each GetSnapshots hit**: the full `Book` for every `Found` entry,
+//!   including all 5 `PriceLevel`s.
+//! - **First Subscribe `BookUpdate`**: the actual shape of the wire payload
+//!   (including `dropped_total`, the `book` field, the `PriceLevel.orders`
+//!   list, etc.).
+//! - **Last Subscribe `BookUpdate`**: lets you compare the first and last
+//!   messages (seq advancement, level changes).
 //!
-//! 这是 demo client 唯一能直接看到「订单簿在 wire 上长什么样」的入口；
-//! 调试新 reviewer / 验证 schema / 排查 proto 字段缺漏时几乎一定要开。
-//! 默认关闭只是为了让 happy-path 输出保持精简、不刷屏。
+//! This is the demo client's only entry point for directly seeing "what an
+//! order book looks like on the wire"; it is almost always required when
+//! onboarding a new reviewer, validating the schema, or chasing missing
+//! proto fields. It is off by default purely to keep happy-path output
+//! concise and avoid scrolling.
 //!
 //! # Env vars
 //!
 //! | Env | Default | Purpose |
 //! |---|---|---|
-//! | `MDS_CLIENT_TARGET`  | `http://127.0.0.1:50051`    | Server endpoint（局域网 demo 换成 `http://<LAN-IP>:50051`） |
-//! | `MDS_CLIENT_FIGI`    | `BBG000000001`              | FIGI to query / subscribe |
-//! | `MDS_CLIENT_FIGIS`   | (same as `MDS_CLIENT_FIGI`) | Comma-separated FIGI list for Subscribe |
+//! | `MDS_CLIENT_TARGET`  | `http://127.0.0.1:50051`    | Server endpoint (for a LAN demo, use `http://<LAN-IP>:50051`) |
+//! | `MDS_CLIENT_FIGI`    | `BBG000000001`              | Default FIGI (used when `MDS_CLIENT_FIGIS` is unset) |
+//! | `MDS_CLIENT_FIGIS`   | (same as `MDS_CLIENT_FIGI`) | Comma-separated FIGI list passed to **both** GetSnapshots and Subscribe |
 //! | `MDS_CLIENT_SECS`    | `3`                         | Subscribe duration (seconds) |
-//! | `MDS_CLIENT_VERBOSE` | (unset)                     | **设为任意非空值**即开启 verbose dump（见上节）。注意 `MDS_CLIENT_VERBOSE=0` 也算开（用的是 `var().is_ok()`）。 |
+//! | `MDS_CLIENT_VERBOSE` | (unset)                     | **Set to any non-empty value** to enable verbose dump (see above). Note that `MDS_CLIENT_VERBOSE=0` also enables it (the code uses `var().is_ok()`). |
 //!
 //! # Usage (PowerShell)
 //!
 //! ```powershell
-//! # 最简：全部默认，仅摘要输出。
+//! # Simplest: all defaults, summary output only.
 //! cargo run -p marketdata-service --bin client --release
 //!
-//! # 推荐：开 verbose，看完整 Book/BookUpdate 结构。
+//! # Recommended: enable verbose to see the full Book/BookUpdate structure.
 //! $env:MDS_CLIENT_VERBOSE = "1"
 //! cargo run -p marketdata-service --bin client --release
 //!
-//! # 多 FIGI + 跑久一点，方便观察 dropped_total。
+//! # Multiple FIGIs + longer run for easier dropped_total observation.
 //! $env:MDS_CLIENT_FIGIS = "BBG000000001,BBG000000002"
 //! $env:MDS_CLIENT_SECS  = "10"
 //! cargo run -p marketdata-service --bin client --release
@@ -55,8 +63,8 @@ use std::time::{Duration, Instant};
 
 use marketdata_service::BoxError;
 use marketdata_service::pb::{
-    BookUpdate, GetSnapshotRequest, SubscribeRequest, market_data_client::MarketDataClient,
-    snapshot_response::Result as SnapResult,
+    BookUpdate, GetSnapshotsRequest, SubscribeRequest, market_data_client::MarketDataClient,
+    snapshot_entry::Result as SnapResult,
 };
 
 #[tokio::main]
@@ -71,39 +79,48 @@ async fn main() -> Result<(), BoxError> {
         .unwrap_or(3);
     let verbose = std::env::var("MDS_CLIENT_VERBOSE").is_ok();
 
-    eprintln!("[client] connecting to {target}");
-    let mut client = MarketDataClient::connect(target).await?;
-
-    // ---- demo 1: unary GetSnapshot ----
-    let resp = client
-        .get_snapshot(GetSnapshotRequest {
-            figi: figi.clone(),
-        })
-        .await?
-        .into_inner();
-    match resp.result {
-        Some(SnapResult::Found(book)) => {
-            eprintln!(
-                "[client] GetSnapshot({figi}) -> Found(seq={}, bids={}, asks={})",
-                book.gateway_seq,
-                book.bids.len(),
-                book.asks.len(),
-            );
-            if verbose {
-                eprintln!("[client] GetSnapshot({figi}) -> Found:\n{book:#?}");
-            }
-        }
-        Some(SnapResult::NotYet(_)) | None => {
-            eprintln!("[client] GetSnapshot({figi}) -> NotYet");
-        }
-    }
-
-    // ---- demo 2: server-streaming Subscribe ----
+    // Used by both GetSnapshots and Subscribe — keeps the two demos
+    // symmetric (matching the batch shape on the wire).
     let figis: Vec<String> = figis_csv
         .split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
+
+    eprintln!("[client] connecting to {target}");
+    let mut client = MarketDataClient::connect(target).await?;
+
+    // ---- demo 1: unary GetSnapshots ----
+    eprintln!("[client] GetSnapshots({figis:?}) ...");
+    let resp = client
+        .get_snapshots(GetSnapshotsRequest {
+            figis: figis.clone(),
+        })
+        .await?
+        .into_inner();
+    for entry in resp.entries {
+        let entry_figi = entry.figi;
+        match entry.result {
+            Some(SnapResult::Found(book)) => {
+                eprintln!(
+                    "[client] GetSnapshots({entry_figi}) -> Found(seq={}, bids={}, asks={})",
+                    book.gateway_seq,
+                    book.bids.len(),
+                    book.asks.len(),
+                );
+                if verbose {
+                    eprintln!(
+                        "[client] GetSnapshots({entry_figi}) -> Found:\n{book:#?}"
+                    );
+                }
+            }
+            Some(SnapResult::NotYet(_)) | None => {
+                eprintln!("[client] GetSnapshots({entry_figi}) -> NotYet");
+            }
+        }
+    }
+
+    // ---- demo 2: server-streaming Subscribe ----
     eprintln!("[client] Subscribe({figis:?}) for {secs}s ...");
 
     let mut stream = client
@@ -116,13 +133,15 @@ async fn main() -> Result<(), BoxError> {
     let deadline = Instant::now() + Duration::from_secs(secs);
     let mut received: u64 = 0;
     let mut final_dropped: u64 = 0;
-    // 保留最后一笔 BookUpdate，供 loop 结束后 verbose dump。
+    // Keep the most recent BookUpdate around so we can dump it in verbose
+    // mode after the loop exits.
     let mut last_upd: Option<BookUpdate> = None;
 
-    // tonic streaming::next() 来自 futures_core::Stream，via prelude.
+    // tonic streaming::next() comes from futures_core::Stream, via prelude.
     use tokio_stream::StreamExt as _;
     loop {
-        // 用 timeout 控总时长；stream 自身可能永远不结束（server 持续推流）。
+        // Use a timeout to bound total duration; the stream itself may never
+        // end (the server keeps pushing).
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break;
@@ -131,11 +150,13 @@ async fn main() -> Result<(), BoxError> {
             Ok(Some(Ok(upd))) => {
                 received += 1;
                 final_dropped = upd.dropped_total;
-                // 第一笔 verbose dump 一次,看 wire payload 的完整形态。
+                // Dump the first message once in verbose mode to inspect the
+                // full wire-payload shape.
                 if verbose && received == 1 {
                     eprintln!("[client] first BookUpdate:\n{upd:#?}");
                 }
-                // 每 50 笔打一行，避免 stdout 爆炸但仍能看到推流活着。
+                // Print one summary line every 50 messages: avoids flooding
+                // stdout while still showing that the stream is alive.
                 if received.is_multiple_of(50) {
                     eprintln!(
                         "[client] recv #{received} dropped_total={final_dropped} \
@@ -157,7 +178,7 @@ async fn main() -> Result<(), BoxError> {
         }
     }
 
-    // 把最后一笔 BookUpdate 完整 dump 出来（verbose 才打）。
+    // Dump the final BookUpdate in full (verbose only).
     if verbose {
         match &last_upd {
             Some(upd) => eprintln!("[client] final BookUpdate:\n{upd:#?}"),

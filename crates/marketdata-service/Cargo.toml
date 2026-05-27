@@ -3,53 +3,55 @@ name = "marketdata-service"
 version.workspace = true
 edition.workspace = true
 description = "Market data message service for the take-home assignment."
-# `cargo run -p marketdata-service` 默认跑 server 而非 client；避免 reviewer
-# 在两个 binary 之间被 cargo 询问 --bin。
+# `cargo run -p marketdata-service` should run the server by default rather than
+# the client; this avoids cargo prompting the reviewer to pick `--bin`.
 default-run = "marketdata-service"
 
 [dependencies]
-# 错误处理：service 层统一用 `Box<dyn Error + Send + Sync + 'static>` (alias
-# `BoxError`，见 `lib.rs`)。
-# - 8 byte thin pointer，等同 anyhow::Error 的 size
-# - `?` 自动从所有 `Error + Send + Sync + 'static` 转换，零样板
-# - 零依赖（纯 std）；library 层另用 thiserror 定义具体 enum
-# 失去的能力：anyhow 的 backtrace 懒加载与 `.context()` ergonomic；
-# 后者用 `.map_err(|e| format!("...: {e}").into())` 替代。
+# Error handling: the service layer uniformly uses
+# `Box<dyn Error + Send + Sync + 'static>` (aliased as `BoxError`, see `lib.rs`).
+# - 8-byte thin pointer, same size as anyhow::Error
+# - `?` automatically converts from any `Error + Send + Sync + 'static`, zero boilerplate
+# - Zero dependency (std only); the library layer defines concrete enums via thiserror
+# Capabilities given up: anyhow's lazy backtrace and `.context()` ergonomics;
+# the latter is replaced with `.map_err(|e| format!("...: {e}").into())`.
 
-# Phase 1 仅用到 tokio::sync (broadcast / mpsc / Notify) + spawn；
-# "full" 是 Phase 2 接 tonic 后才真正用满。
+# We only use tokio::sync (broadcast / mpsc / Notify) + spawn for the core
+# bus/snapshot layer; the "full" feature is fully exercised only once tonic
+# is integrated.
 tokio = { workspace = true }
 
-# Snapshot 表底层：DashMap<Figi, BookMessage>。
+# Backing store for the snapshot table: DashMap<Figi, BookMessage>.
 dashmap = { workspace = true }
 
-# 上游 feed（GUIDELINE I3：唯一接点）。
+# Upstream feed (the sole contact point with the vendor crate).
 feed-sim = { workspace = true }
 
-# 共享型别：BookMessage / Figi 等。
+# Shared types: BookMessage / Figi etc.
 marketdata-types = { workspace = true }
 
-# Phase 2: gRPC wire 层依赖。
+# gRPC wire-layer dependencies.
 tonic = { workspace = true }
 prost = { workspace = true }
-# 把 mpsc::Receiver 包成 Stream，喂给 tonic 的 server-streaming 返回值。
+# Wraps mpsc::Receiver as a Stream for tonic's server-streaming return type.
 tokio-stream = { workspace = true }
 
 [build-dependencies]
-# .proto -> Rust 代码生成（在 OUT_DIR；src/grpc.rs 用 tonic::include_proto! 拉回）。
+# .proto -> Rust code generation (into OUT_DIR; src/grpc.rs pulls it back in via tonic::include_proto!).
 tonic-build = { workspace = true }
-# 内置 protoc 二进制，build.rs 注入 PROTOC env var；reviewer 不需手动装 protobuf-compiler。
+# Bundled protoc binary; build.rs injects PROTOC env var so the reviewer does
+# not need to install protobuf-compiler manually.
 protoc-bin-vendored = { workspace = true }
 
 [lints.rust]
 unused_must_use = "warn"
 
-# Server entrypoint（Phase 1 起即存在）。
+# Server entrypoint.
 [[bin]]
 name = "marketdata-service"
 path = "src/main.rs"
 
-# Phase 2 新增：sample client（README §6）。
+# Sample client (covers the assignment's end-to-end client demo requirement).
 [[bin]]
 name = "client"
 path = "src/bin/client.rs"

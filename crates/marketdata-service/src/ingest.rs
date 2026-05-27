@@ -1,19 +1,23 @@
-//! 单一执行緒 ingest 循环：拉 upstream → 写 snapshot → 广播 bus。
+//! Single-threaded ingest loop: pull upstream → write snapshot → broadcast bus.
 //!
-//! # 为什么是 `std::thread` 而不是 `tokio::task`
+//! # Why `std::thread` instead of `tokio::task`
 //!
-//! [`crate::upstream::Upstream`] 是同步阻塞 API（`wait()` 内部 `thread::sleep`），
-//! 放进 tokio worker 会占住一个 OS thread, 干扰其它 async 任务。专用 OS
-//! thread 是正解。
+//! [`crate::upstream::Upstream`] is a synchronous blocking API (`wait()`
+//! internally uses `thread::sleep`); putting it on a tokio worker would
+//! occupy an OS thread and disrupt other async tasks. A dedicated OS
+//! thread is the right tool.
 //!
-//! # 不变量
+//! # Invariants
 //!
-//! - **Ingest 永不被下游阻塞**：`snapshot.put` 是 DashMap shard write lock
-//!   (极短), `bus.publish` 是 `broadcast::send` (容量满自动丢最旧, 非阻塞)。
-//! - **顺序: 先 `snapshot.put` 后 `bus.publish`** —— 订阅者收到 update 时,
-//!   `GetSnapshot(figi)` 一定能读到至少同一笔。反过来不成立 (snapshot 可能
-//!   领先 bus 一笔), 但那是订阅者还没来得及收到的窗口, 不影响"快照不会落
-//!   后于流"这个对外契约。
+//! - **Ingest is never blocked by downstream**: `snapshot.put` only holds a
+//!   DashMap shard write lock (extremely brief); `bus.publish` is
+//!   `broadcast::send` (non-blocking, drops the oldest entry on full).
+//! - **Order: `snapshot.put` before `bus.publish`** — when a subscriber
+//!   receives an update, `GetSnapshots([figi])` is guaranteed to read at
+//!   least the same message. The reverse does not hold (snapshot may lead
+//!   bus by one message), but that gap is simply the window before the
+//!   subscriber has been able to receive — it does not violate the public
+//!   contract that "the snapshot never lags behind the stream".
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,41 +28,53 @@ use crate::bus::Bus;
 use crate::snapshot::Snapshot;
 use crate::upstream::Upstream;
 
-/// Ingest 线程的控制句柄。Drop 时自动通知 ingest 退出并 join。
+/// Control handle for the ingest thread. On drop, automatically signals
+/// ingest to stop and joins the thread.
 pub struct IngestHandle {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<IngestStats>>,
 }
 
-/// Ingest 退出时的累计统计。
+/// Cumulative statistics produced when ingest exits.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct IngestStats {
-    /// 实际成功收到 / 写入 snapshot / 广播的笔数。
+    /// Number of messages actually received / written to snapshot /
+    /// broadcast.
     pub received: u64,
-    /// `gateway_seq` 不连续的**事件次数** (每次跳跃 = +1, 无论跳几笔)。
+    /// **Event count** of `gateway_seq` discontinuities (each jump = +1,
+    /// regardless of how many messages were skipped).
     ///
-    /// 粒度选择 "event count" 而非 "缺笔总数":前者足以让运维察觉异常,
-    /// 后者要维护额外滑窗。"漏几笔阈值告警"、"主动 resync 复原"等更精细的
-    /// gap 治理超出本次 deliverable 范围,故意只埋 counter 不做反应。
+    /// We chose "event count" over "total missed messages" granularity:
+    /// the former is enough for operators to notice an anomaly; the
+    /// latter would require maintaining a sliding window. Finer gap
+    /// handling such as "alert on missed-count threshold" or "active
+    /// resync recovery" is out of scope for this deliverable, so we
+    /// deliberately only expose a counter without any reaction.
     pub gaps: u64,
 }
 
 impl IngestHandle {
-    /// 取 stop 信号的 `Arc` clone，让 [`Service::run`](crate::Service::run)
-    /// 在 `tokio::select!` 拿走 `IngestHandle` 之后仍能从外部触发 stop
-    /// (一律 `.store(true, Release)`)。
+    /// Returns an `Arc` clone of the stop signal so that
+    /// [`Service::run`](crate::Service::run) can still trigger stop
+    /// externally after `tokio::select!` has taken ownership of the
+    /// `IngestHandle` (always via `.store(true, Release)`).
     ///
-    /// 直接暴露 `Arc<AtomicBool>` 而非 `StopToken` newtype:service crate 内部
-    /// 使用, 不出 crate 边界, 类型包装的收益不抵 boilerplate 成本。
+    /// We expose `Arc<AtomicBool>` directly rather than a `StopToken`
+    /// newtype: this is internal to the service crate and does not cross
+    /// the crate boundary, so the benefit of type wrapping does not
+    /// justify the boilerplate.
     pub fn stop_token(&self) -> Arc<AtomicBool> {
         self.stop.clone()
     }
 
-    /// **等 ingest 自然退出**（不主动发 stop 信号）。
+    /// **Wait for ingest to exit on its own** (does not send a stop signal).
     ///
-    /// 典型用法：上游有 `max_messages` cap，等它自然 EOF；或调用方先
-    /// 手动 [`stop`](Self::stop) 再 `join`。直接 `join` 一个无 cap 的 ingest
-    /// 会**永远阻塞**——这是有意的，让"非阻塞 stop"与"等结束"两个语义分离。
+    /// Typical usage: the upstream has a `max_messages` cap, and we wait
+    /// for it to reach natural EOF; or the caller has already called
+    /// [`stop`](Self::stop) manually and then calls `join`. Directly
+    /// joining an uncapped ingest **blocks forever** — this is
+    /// intentional, keeping "non-blocking stop" and "wait for end" as two
+    /// distinct semantics.
     pub fn join(mut self) -> IngestStats {
         self.thread
             .take()
@@ -76,11 +92,14 @@ impl Drop for IngestHandle {
     }
 }
 
-/// 启动 ingest 线程。
+/// Spawn the ingest thread.
 ///
-/// 走泛型 `U` 而非 `Box<dyn Upstream>` (静态分派):`Upstream::receive` 是每秒
-/// 上千次的热路径,不容忍虚函数开销。trade-off:Service 装配处选完上游类型
-/// 后类型即固定,不能在运行时切换;但本服务只在 main 装配一次,无此需求。
+/// Uses generic `U` rather than `Box<dyn Upstream>` (static dispatch):
+/// `Upstream::receive` is a hot path called thousands of times per
+/// second and does not tolerate virtual call overhead. Trade-off: once
+/// Service assembly has chosen the upstream type it is fixed and cannot
+/// be switched at runtime; but this service only assembles once in main,
+/// so there is no such requirement.
 pub fn spawn<U>(
     upstream: U,
     snapshot: Arc<Snapshot>,
@@ -114,29 +133,37 @@ fn ingest_loop<U: Upstream>(
     stop: Arc<AtomicBool>,
 ) -> IngestStats {
     let mut stats = IngestStats::default();
-    // upstream 契约:`gateway_seq` 全流严格递增 —— 用作 gap 检测的唯一可靠依据。
+    // Upstream contract: `gateway_seq` is strictly monotonic across the
+    // entire stream — the only reliable basis for gap detection.
     let mut last_seq: Option<u64> = None;
 
     loop {
         if stop.load(Ordering::Acquire) {
             break;
         }
-        // 外层 wait：唯一合法的"上游结束"信号通道。
+        // Outer `wait`: the only legitimate "upstream has ended" signal channel.
         if upstream.wait(poll_interval).is_err() {
             break;
         }
 
-        // 内层 drain loop：把当下 buffer 一次掏空，再回外层 wait。
-        // 缺这层 → 每 poll_interval 只取一笔，feed-sim buffer 必然溢位丢消息。
+        // Inner drain loop: empty the current buffer in one sweep before
+        // returning to the outer `wait`. Without this layer, only one
+        // message would be taken per `poll_interval`, and the feed-sim
+        // buffer would inevitably overflow and drop messages.
         loop {
             match upstream.receive() {
                 Ok(Some(book)) => {
                     stats.received += 1;
 
-                    // 用 `!=` 而非 `<` 检测 gap:依赖 upstream 单调递增的契约。
-                    // 若未来上游允许乱序到达(例如多 partition 合流),这里要改成
-                    // 维护一个 in-flight set + 收完 N 笔再判 gap, 否则乱序到达
-                    // 也会被误报成 gap。当前 feed-sim 单线程严格递增, 无此问题。
+                    // Use `!=` rather than `<` for gap detection: this
+                    // relies on the upstream's strict monotonic contract.
+                    // If a future upstream allows out-of-order arrivals
+                    // (e.g. fan-in from multiple partitions), this must
+                    // become "maintain an in-flight set + judge gap after
+                    // N messages", otherwise out-of-order arrivals would
+                    // be misreported as gaps. The current feed-sim is
+                    // single-threaded and strictly monotonic, so this is
+                    // not an issue.
                     if let Some(prev) = last_seq
                         && book.gateway_seq != prev + 1
                     {
@@ -144,7 +171,7 @@ fn ingest_loop<U: Upstream>(
                     }
                     last_seq = Some(book.gateway_seq);
 
-                    // 先 snapshot，后 bus —— 顺序敏感。
+                    // snapshot first, bus second — order-sensitive.
                     snapshot.put(book);
                     bus.publish(book);
 
@@ -162,9 +189,11 @@ fn ingest_loop<U: Upstream>(
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    // 单条错误不应杀整个服务;log + 跳回外层 wait, 下一轮 poll
-                    // 重新尝试。若错误是持续性的, 反映为 stderr 噪音 + 0 吞吐,
-                    // 由 operator 决定是否重启。
+                    // A single error must not kill the entire service:
+                    // log + return to the outer wait and retry on the
+                    // next poll. If the error is persistent, the symptom
+                    // is stderr noise + zero throughput, and the
+                    // operator decides whether to restart.
                     eprintln!("[ingest] receive error: {e:?}");
                     break;
                 }
@@ -187,8 +216,9 @@ mod tests {
     use super::*;
     use crate::upstream::{MockUpstream, make_book};
 
-    /// 推入 N 笔连续 seq、close upstream、等 ingest 自然 EOF。
-    /// 验证 ingest_loop 正确 drain + 写 snapshot + 不误报 gap。
+    /// Push N consecutive seq messages, close the upstream, and wait for
+    /// ingest to reach natural EOF. Verifies that ingest_loop drains
+    /// correctly, writes to snapshot, and does not misreport gaps.
     #[test]
     fn ingest_drains_finite_mock_and_populates_snapshot() {
         let (up, handle_in) = MockUpstream::new();
@@ -196,7 +226,7 @@ mod tests {
         let bus = Arc::new(Bus::new(16));
 
         for seq in 1..=30u64 {
-            // 3 个 FIGI 轮替，验证 snapshot.len() == 3
+            // Rotate across 3 FIGIs to verify snapshot.len() == 3.
             let figi = format!("F{:011}", seq % 3);
             handle_in.push(make_book(&figi, seq));
         }
@@ -216,8 +246,9 @@ mod tests {
         assert_eq!(stats.gaps, 0, "1..=30 has no gaps");
     }
 
-    /// 守 "gateway_seq 不连续 → 累进 gap event" 这一条 ingest_loop 契约。
-    /// 注入 seq=1, 2, 5 → ingest_loop 应在 5 处累进一次 `gaps`。
+    /// Guards the ingest_loop contract: "discontinuous gateway_seq →
+    /// increment a gap event". Inject seq=1, 2, 5 → ingest_loop should
+    /// increment `gaps` once at the 5.
     #[test]
     fn gap_counter_increments_on_skipped_seq() {
         let (up, handle_in) = MockUpstream::new();
@@ -226,7 +257,7 @@ mod tests {
 
         handle_in.push(make_book("BBG000000001", 1));
         handle_in.push(make_book("BBG000000001", 2));
-        // seq 跳到 5 —— 3 与 4 缺失，对应一次 gap event。
+        // Seq jumps to 5 — 3 and 4 are missing, corresponding to one gap event.
         handle_in.push(make_book("BBG000000001", 5));
         handle_in.close();
 
@@ -243,11 +274,13 @@ mod tests {
         assert_eq!(stats.gaps, 1, "skipping 3,4 between 2 and 5 = 1 gap event");
     }
 
-    /// 守 ingest 顺序不变量:"先 snapshot.put、后 bus.publish"。
+    /// Guards the ingest order invariant: "snapshot.put before bus.publish".
     ///
-    /// 推一笔 → ingest 结束 → assert snapshot 必含这笔。bus 未必有订阅者,
-    /// 但 snapshot 必须先写好 —— 否则订阅者收到 update 后立刻 GetSnapshot 会
-    /// 读到老快照, 破坏 "GetSnapshot 不落后于流" 的对外契约。
+    /// Push one message → ingest ends → assert that snapshot contains it.
+    /// The bus may have no subscribers, but the snapshot must be written
+    /// first — otherwise a subscriber receiving an update and immediately
+    /// calling GetSnapshots would read a stale snapshot, breaking the
+    /// public contract "GetSnapshots never lags behind the stream".
     #[test]
     fn snapshot_populated_before_join_returns() {
         let (up, handle_in) = MockUpstream::new();

@@ -8,15 +8,17 @@ use crate::config::UpstreamConfig;
 
 use super::Upstream;
 
-/// 真实 (默认) [`Upstream`] 实作 —— 包 [`FeedSubscriber`], 把 `feed_sim` 类型
-/// 封死在本档内。换上游 (例如真实 iceoryx2) 时, 仅需新增同级 `iceoryx2.rs`
-/// 实现 [`Upstream`] trait, ingest / service 装配端 0 改动。
+/// The real (default) [`Upstream`] implementation — wraps
+/// [`FeedSubscriber`] to seal `feed_sim` types inside this file. When
+/// swapping the upstream (e.g. real iceoryx2), just add a sibling
+/// `iceoryx2.rs` implementing the [`Upstream`] trait; ingest and the
+/// service assembly site change by zero.
 pub struct FeedSimUpstream {
     inner: FeedSubscriber,
 }
 
 impl FeedSimUpstream {
-    /// 构造并立即启动上游背景执行緒。
+    /// Construct and immediately start the upstream background thread.
     pub fn new(cfg: UpstreamConfig) -> Result<Self, BoxError> {
         let sc: SubscriberConfig = cfg.into();
         let inner = FeedSubscriber::new(sc).map_err(|e| -> BoxError {
@@ -29,9 +31,11 @@ impl FeedSimUpstream {
 impl Upstream for FeedSimUpstream {
     fn receive(&self) -> Result<Option<BookMessage>, BoxError> {
         match self.inner.receive() {
-            // `FeedSample` 在此处 deref 后值拷贝 (~408 bytes, `Copy`)。跨线程
-            // 传递必须传值 —— 引用会被 sample 生命周期绑住, 无法跨 ingest /
-            // service 边界。值拷贝在 1k msg/s 默认速率下 ~ 408 KB/s, 无瓶颈。
+            // `FeedSample` is deref'd and value-copied here (~408 bytes,
+            // `Copy`). Cross-thread transfer must be by value — a
+            // reference would be tied to the sample's lifetime and could
+            // not cross the ingest / service boundary. At the default
+            // 1k msg/s, value copies amount to ~408 KB/s — no bottleneck.
             Ok(Some(sample)) => Ok(Some(*sample)),
             Ok(None) => Ok(None),
             Err(e) => Err(format!("feed-sim receive failed: {e:?}").into()),

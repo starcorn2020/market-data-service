@@ -1,19 +1,25 @@
 // Wire schema for market-data-service.
 //
 // Two RPCs map 1:1 onto the assignment's two APIs:
-//   * GetSnapshot  -> request/response  (README #3)
-//   * Subscribe    -> server-streaming  (README #4)
+//   * GetSnapshots -> request/response  (batch latest-snapshot lookup)
+//   * Subscribe    -> server-streaming
 //
-// See AI_DEV_GUILDELINE.md §4.3 for the design rationale.
+// Both RPCs take a batch of FIGIs so the two surfaces stay symmetric.
 
 syntax = "proto3";
 package marketdata.v1;
 
 service MarketData {
-    // Latest snapshot for a single FIGI. `NotYet` is a first-class response
-    // (README #3: "clearly-defined no data yet"), distinct from "this FIGI
-    // does not exist" — server cannot tell those apart in 3-day scope.
-    rpc GetSnapshot(GetSnapshotRequest) returns (SnapshotResponse);
+    // Latest snapshot for one or more FIGIs. Returns one SnapshotEntry per
+    // requested FIGI, in the same order. `NotYet` per entry is a first-class
+    // response ("clearly-defined no data yet"), distinct from "this FIGI does
+    // not exist" — the server cannot tell those apart in 3-day scope.
+    //
+    // No cross-FIGI atomicity: each entry is the latest snapshot for its
+    // FIGI at the moment the server read it; ingest may have written other
+    // FIGIs between reads. Semantically equivalent to issuing N parallel
+    // single-FIGI lookups.
+    rpc GetSnapshots(GetSnapshotsRequest) returns (GetSnapshotsResponse);
 
     // Live updates for one or more FIGIs. Server-streaming: server pushes
     // each new BookMessage as it lands in the snapshot table. Drop semantics
@@ -21,14 +27,23 @@ service MarketData {
     rpc Subscribe(SubscribeRequest) returns (stream BookUpdate);
 }
 
-message GetSnapshotRequest {
-    string figi = 1;
+message GetSnapshotsRequest {
+    repeated string figis = 1;
 }
 
-message SnapshotResponse {
+message GetSnapshotsResponse {
+    // One entry per requested FIGI, in request order.
+    repeated SnapshotEntry entries = 1;
+}
+
+// Per-FIGI snapshot result inside a GetSnapshots response. `figi` is echoed
+// back so the client does not need to depend on entry order to match
+// requests with results.
+message SnapshotEntry {
+    string figi = 1;
     oneof result {
-        Book   found   = 1;
-        NotYet not_yet = 2;
+        Book   found   = 2;
+        NotYet not_yet = 3;
     }
 }
 
@@ -44,7 +59,7 @@ message BookUpdate {
     // Server-side cumulative drop count for this subscription. The client
     // computes lost-in-interval as (curr.dropped_total - prev.dropped_total).
     // Cumulative (not delta) so the client auto-aligns on first message and
-    // tolerates reordering / single message loss. See GUIDELINE §4.3.3.
+    // tolerates reordering / single message loss.
     uint64 dropped_total = 2;
 }
 

@@ -1,39 +1,50 @@
-//! Per-FIGI 最新快照表。
+//! Per-FIGI latest-snapshot table.
 //!
-//! # 设计要点
+//! # Design notes
 //!
-//! - 底层 `DashMap<Figi, BookMessage>`:shard-locked HashMap, 读写都不阻塞,
-//!   契合 ingest (写多) + RPC (读少) 的非对称负载。
-//! - `BookMessage` 是 `#[repr(C)] + Copy`, 整份 ~408 bytes:
-//!   - 写:`insert` 直接整份覆盖, **不做** increment 合并 —— 上游契约保证
-//!     每笔 `BookMessage` 已是 top-10 完整快照, 不需要在 service 这层合并。
-//!   - 读:值拷贝出去 (不回 `&BookMessage`, 避免跨线程生命周期纠缠)。
-//! - `Figi` 是 `[u8; 12] + Copy + Hash + Eq`, **直接当 key**, 不做成 `String`。
+//! - Backed by `DashMap<Figi, BookMessage>`: a shard-locked HashMap; reads
+//!   and writes do not block each other, matching the asymmetric load of
+//!   ingest (write-heavy) + RPC (read-light).
+//! - `BookMessage` is `#[repr(C)] + Copy`, ~408 bytes:
+//!   - Write: `insert` performs a full overwrite; we **do not** merge
+//!     increments — the upstream contract guarantees that each
+//!     `BookMessage` is already a complete top-10 snapshot, no merging
+//!     needed at the service layer.
+//!   - Read: returns a value copy (not `&BookMessage`, to avoid
+//!     cross-thread lifetime entanglement).
+//! - `Figi` is `[u8; 12] + Copy + Hash + Eq` and is used **directly as the
+//!   key**, not wrapped in a `String`.
 //!
-//! # 为何选 `DashMap` 而非 `Arc<RwLock<HashMap>>`
+//! # Why `DashMap` over `Arc<RwLock<HashMap>>`
 //!
-//! DashMap 把 map 切成 N 个 shard, 每个 shard 各自一把 RwLock;distinct FIGI
-//! 通常落在不同 shard, **互不阻塞**。`Arc<RwLock<HashMap>>` 反而把所有访问
-//! 串行化 —— ingest write 期间所有 RPC read 都要等, 破坏 "读路径也不被
-//! 写路径阻塞" 的对外契约。
+//! DashMap splits the map into N shards, each guarded by its own RwLock;
+//! distinct FIGIs usually land in different shards and **do not block each
+//! other**. `Arc<RwLock<HashMap>>` instead serializes all access — during
+//! an ingest write every RPC read has to wait, breaking the public
+//! contract that "the read path is never blocked by the write path".
 //!
-//! `Arc<T>` 本身**不是锁**, 只是引用计数, hot path 上 `Arc::deref` 是零成本
-//! 指针解引用 —— 概念上和 `Mutex<T>` / `RwLock<T>` 完全两回事。
+//! `Arc<T>` is **not a lock**; it is just a reference count. On the hot
+//! path `Arc::deref` is a zero-cost pointer deref — conceptually entirely
+//! different from `Mutex<T>` / `RwLock<T>`.
 //!
-//! # 为何不抽 trait
+//! # Why no trait abstraction
 //!
-//! 与 `Upstream` 抽 trait (为 mock + 未来换上游铺路) 不同, `Snapshot` 是
-//! **内部模组** (`mod snapshot;` private), 没有第二个实作需求, 也没有"测试
-//! 要 mock" 的压力 —— DashMap 已经够轻量, unit test 直接构造真实 `Snapshot`
-//! 实例即可。抽 trait 只会增加 vtable / 泛型噪声而无任何收益。
+//! Unlike `Upstream` (which is behind a trait to support mocks + future
+//! upstream swaps), `Snapshot` is an **internal module** (`mod snapshot;`
+//! private). There is no second implementation requirement and no
+//! "tests need to mock" pressure — DashMap is already lightweight enough,
+//! and unit tests construct a real `Snapshot` instance directly. Adding a
+//! trait would only introduce vtable / generics noise with no benefit.
 //!
-//! 唯一对外泄漏的是 `Service::snapshot_len() -> usize` (demo / 测试用的
-//! 标量), 完全在"不泄漏内部类型"的安全侧。
+//! The only thing exposed publicly is `Service::snapshot_len() -> usize`
+//! (a scalar, for demo / test purposes), which is safely on the "no
+//! internal type leaks" side.
 
 use dashmap::DashMap;
 use marketdata_types::{BookMessage, Figi};
 
-/// Per-FIGI 最新快照表。线程安全，可 `Arc` 共享给 ingest 与 RPC handler。
+/// Per-FIGI latest-snapshot table. Thread-safe, shareable via `Arc`
+/// between ingest and RPC handlers.
 #[derive(Default)]
 pub struct Snapshot {
     inner: DashMap<Figi, BookMessage>,
@@ -44,36 +55,41 @@ impl Snapshot {
         Self::default()
     }
 
-    /// 整份覆盖写入。Ingest hot path 调用。
+    /// Full-overwrite write. Called on the ingest hot path.
     ///
-    /// # 整份覆盖语义
+    /// # Full-overwrite semantics
     ///
-    /// `BookMessage` 已经是 top-10 完整快照 (upstream 契约), 本方法直接
-    /// `insert`, **绝不做** order-by-order / increment 合并 —— 旧 entry 的
-    /// 任何字段都不应残留。由 [`tests::put_overwrites_entire_book_not_merge`]
-    /// 守护:若未来有人"优化"成"合并旧新 bids/asks", 该测试 fail。
+    /// `BookMessage` is already a complete top-10 snapshot (per upstream
+    /// contract); this method simply calls `insert` and **never** performs
+    /// any order-by-order / incremental merge — no field from the previous
+    /// entry should linger. Guarded by
+    /// [`tests::put_overwrites_entire_book_not_merge`]: if anyone later
+    /// "optimizes" this into a merge of old and new bids/asks, that test
+    /// fails.
     #[inline]
     pub fn put(&self, msg: BookMessage) {
         self.inner.insert(msg.figi, msg);
     }
 
-    /// 取该 FIGI 的最新快照值。
+    /// Read the latest snapshot value for the given FIGI.
     ///
-    /// `None` 即题面要求的 "clearly-defined no data yet" 信号;gRPC handler 把
-    /// 这个映射到 `SnapshotResponse::NotYet`。
+    /// `None` is the "clearly-defined no data yet" signal required by the
+    /// assignment; the gRPC handler maps it to the `NotYet` variant inside
+    /// each `SnapshotEntry` of the `GetSnapshots` response.
     #[inline]
     pub fn get(&self, figi: &Figi) -> Option<BookMessage> {
         self.inner.get(figi).map(|e| *e.value())
     }
 
-    /// 已知 FIGI 数。
+    /// Number of known FIGIs.
     pub fn len(&self) -> usize {
         self.inner.len()
     }
 
-    /// 与 [`Self::len`] 配套 —— Rust API 惯例要求 `len` + `is_empty` 成对暴露
-    /// (clippy `len_without_is_empty`)。当前 production 路径用 `len`, 但保留
-    /// `is_empty` 以符合 idiom。
+    /// Paired with [`Self::len`] — Rust API convention requires `len` and
+    /// `is_empty` to be exposed together (clippy `len_without_is_empty`).
+    /// The current production path uses `len`, but `is_empty` is kept to
+    /// match the idiom.
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
@@ -82,20 +98,22 @@ impl Snapshot {
 
 #[cfg(test)]
 mod tests {
-    //! Snapshot 单元测试。
+    //! Snapshot unit tests.
     //!
-    //! 守的契约:
+    //! Contracts guarded:
     //!
-    //! | 测试 | 守的契约 |
+    //! | Test | Contract |
     //! |---|---|
-    //! | `put_then_get_returns_latest` | 同 FIGI 二次 put 后 get 返新 seq (基础 happy path) |
-    //! | `get_returns_none_for_unknown_figi` | 未知 FIGI 返 `None` → wire 层 `NotYet` |
-    //! | `put_overwrites_entire_book_not_merge` | **整份覆盖**:绝不做增量合并 |
-    //! | `is_empty_reflects_population` | `is_empty` / `len` 在初始 + 推入后的行为一致 |
+    //! | `put_then_get_returns_latest` | A second put on the same FIGI must surface the new seq on get (basic happy path) |
+    //! | `get_returns_none_for_unknown_figi` | Unknown FIGI returns `None` → maps to `NotYet` on the wire |
+    //! | `put_overwrites_entire_book_not_merge` | **Full overwrite**: never an incremental merge |
+    //! | `is_empty_reflects_population` | `is_empty` / `len` behave consistently before and after insertion |
     //!
-    //! **不**写并发 put 测试:DashMap 自身已被业界压测, 自己写一个 `tokio::join!`
-    //! 多 task 测试本质是测 DashMap, 信号弱 + 复杂度高。若未来发现真实 race,
-    //! 补 deterministic regression test 即可。
+    //! We deliberately **do not** add a concurrent-put test: DashMap has
+    //! been stress-tested by the wider community, so writing a
+    //! `tokio::join!` multi-task test essentially tests DashMap itself —
+    //! weak signal, high complexity. If a real race surfaces in the
+    //! future, we will add a deterministic regression test then.
 
     use super::*;
     use marketdata_types::BookLevel;
@@ -126,13 +144,16 @@ mod tests {
         assert!(s.get(&figi("BBG000000999")).is_none());
     }
 
-    /// 守 "整份覆盖, 不做 increment 合并" 的契约 —— 来自题面 non-goal:
-    /// "Building an L3 book from increments — `BookMessage` is already a top-10
-    /// snapshot"。直接 `snapshots.insert(msg.figi, *msg)`。
+    /// Guards the "full overwrite, no incremental merge" contract — from
+    /// the assignment's non-goal: "Building an L3 book from increments —
+    /// `BookMessage` is already a top-10 snapshot". Implementation is
+    /// simply `snapshots.insert(msg.figi, *msg)`.
     ///
-    /// 旧 book `bid_count=2 / ask_count=1`, 新 book `bid_count=1 / ask_count=2`;
-    /// 第二次 `put` 后 `get` 必须**完整反映新 book**, 旧 book 的任何字段都不
-    /// 残留。若未来有人把 `put` 改为"合并旧新 bids/asks", 本测试 fail。
+    /// Old book: `bid_count=2 / ask_count=1`; new book: `bid_count=1 /
+    /// ask_count=2`. After the second `put`, `get` must **fully reflect
+    /// the new book**, with no field from the old book leaking through.
+    /// If anyone later turns `put` into "merge old and new bids/asks",
+    /// this test fails.
     #[test]
     fn put_overwrites_entire_book_not_merge() {
         let s = Snapshot::new();
@@ -163,29 +184,34 @@ mod tests {
         s.put(new);
 
         let got = s.get(&f).expect("FIGI present after second put");
-        assert_eq!(got.gateway_seq, 2, "seq 必须反映新 book");
+        assert_eq!(got.gateway_seq, 2, "seq must reflect the new book");
         assert_eq!(
             got.bid_count, 1,
-            "bid_count 必为 new(=1), 旧 bid_count=2 绝不残留"
+            "bid_count must be new(=1); the old bid_count=2 must not leak through"
         );
-        assert_eq!(got.ask_count, 2, "ask_count 必为 new(=2)");
-        assert_eq!(got.bids[0].price, 200.0, "首档 bid 必为 new 的 200.0");
-        assert_eq!(got.asks[0].price, 201.0, "首档 ask 必为 new 的 201.0");
-        assert_eq!(got.asks[1].price, 202.0, "次档 ask 必为 new 的 202.0");
-        // 注:`bids[1]` 不验 —— `BookMessage` 是 `#[repr(C)] + Copy` 整份覆盖,
-        // 数组 slot 由 default 重置, 但**有效范围**由 `bid_count` 控制
-        // (`.bids()` / `.asks()` 切片只返回 count 范围内)。这里只验 "**有效**
-        // 部分必为 new"。
+        assert_eq!(got.ask_count, 2, "ask_count must be new(=2)");
+        assert_eq!(got.bids[0].price, 200.0, "top bid must be new's 200.0");
+        assert_eq!(got.asks[0].price, 201.0, "top ask must be new's 201.0");
+        assert_eq!(got.asks[1].price, 202.0, "second-level ask must be new's 202.0");
+        // Note: `bids[1]` is intentionally not asserted — `BookMessage`
+        // is `#[repr(C)] + Copy` and overwritten in full; the array slots
+        // are reset by default, but the **effective range** is controlled
+        // by `bid_count` (the `.bids()` / `.asks()` slices only return the
+        // first `count` entries). This only verifies that the **effective**
+        // portion matches new.
     }
 
-    /// 守 `is_empty` / `len` 在初始与推入后的行为一致。
+    /// Guards consistent behavior of `is_empty` / `len` before and after
+    /// insertion.
     ///
-    /// `is_empty` 是 clippy `len_without_is_empty` 强制的配对暴露, 无 production
-    /// 调用者, 但作为 public API 仍需测试覆盖 —— 防止未来 wrapper bug 无回归保护。
+    /// `is_empty` is the paired API enforced by clippy
+    /// `len_without_is_empty`; it has no production callers, but as a
+    /// public API it still needs test coverage — preventing future
+    /// wrapper bugs from going unnoticed.
     #[test]
     fn is_empty_reflects_population() {
         let s = Snapshot::new();
-        assert!(s.is_empty(), "起始必为空");
+        assert!(s.is_empty(), "initially must be empty");
         assert_eq!(s.len(), 0);
 
         let m = BookMessage {
@@ -194,7 +220,7 @@ mod tests {
         };
         s.put(m);
 
-        assert!(!s.is_empty(), "put 一笔后 is_empty 必为 false");
+        assert!(!s.is_empty(), "is_empty must be false after one put");
         assert_eq!(s.len(), 1);
     }
 }

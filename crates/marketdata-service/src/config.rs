@@ -1,17 +1,22 @@
-//! 服务级配置。
+//! Service-level configuration.
 //!
-//! # 设计要点
+//! # Design notes
 //!
-//! - [`UpstreamConfig`] 是 service crate **自己拥有**的 plain struct,**不**
-//!   直接复用 `feed_sim::SubscriberConfig`。这把 feed-sim 的类型边界封死在
-//!   `upstream::feed_sim` 模块内:未来换成真实 iceoryx2 时,本 struct 的字段
-//!   重定义即可,[`ServiceConfig`] 对外 shape 与 wire schema 0 改动。
+//! - [`UpstreamConfig`] is a plain struct **owned by this crate**; it does
+//!   **not** directly reuse `feed_sim::SubscriberConfig`. This seals the
+//!   feed-sim type boundary inside the `upstream::feed_sim` module: when
+//!   we swap to a real iceoryx2 in the future, only the fields of this
+//!   struct need to be redefined; [`ServiceConfig`]'s public shape and
+//!   the wire schema change by zero.
 //!
-//! - [`UpstreamConfig`] → `SubscriberConfig` 的映射是 `From` impl,**仅 service
-//!   crate 内部**(`upstream::feed_sim`)使用,不出 crate 边界。
+//! - The mapping from [`UpstreamConfig`] → `SubscriberConfig` is a `From`
+//!   impl used **only inside the service crate** (`upstream::feed_sim`),
+//!   never crossing the crate boundary.
 //!
-//! - 环境变量命名:上游字段直接复用 feed-sim 既有的 `SIM_*`(reviewer 跑
-//!   `feed-sim` 自己的 demo 时不困惑);本 crate 引入的字段加 `MDS_` 前缀。
+//! - Environment variable naming: upstream fields directly reuse the
+//!   `SIM_*` names already used by feed-sim (so a reviewer running
+//!   feed-sim's own demo is not confused); fields introduced by this
+//!   crate use the `MDS_` prefix.
 
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -25,31 +30,33 @@ use crate::BoxError;
 // UpstreamConfig
 // ---------------------------------------------------------------------------
 
-/// 上游 feed 配置（service crate 自有型别，**不洩漏 `feed_sim::*`**）。
+/// Upstream feed configuration (a service-crate-owned type; **does not
+/// leak `feed_sim::*`**).
 #[derive(Debug, Clone)]
 pub struct UpstreamConfig {
-    /// 模拟 FIGI 数量。
+    /// Number of simulated FIGIs.
     pub instruments: u32,
 
-    /// 跨所有 FIGI 的总目标速率 (msg/s)。
+    /// Aggregate target rate across all FIGIs (msg/s).
     pub rate_hz: u32,
 
-    /// 每条 message 的盘口檔位数 (1..=10)。
+    /// Book depth per message (1..=10).
     pub depth: u8,
 
-    /// 累计 message 上限。`None` = 无限。
+    /// Cumulative message cap. `None` = unlimited.
     pub max_messages: Option<u64>,
 
-    /// 决定性 RNG 种子；固定后流可重现。
+    /// Deterministic RNG seed; fixing it makes the stream reproducible.
     pub seed: u64,
 
-    /// `gateway_seq` 起始值。
+    /// Starting value of `gateway_seq`.
     pub start_seq: u64,
 
-    /// 上游内部 buffer 容量；满了会丢最旧（slow consumer 语义）。
+    /// Internal upstream buffer capacity; when full the oldest entries
+    /// are dropped (slow-consumer semantics).
     pub buffer_size: usize,
 
-    /// `None` => steady pacing；`Some(n)` => bursty:n。
+    /// `None` => steady pacing; `Some(n)` => bursty:n.
     pub burst_size: Option<u32>,
 }
 
@@ -68,8 +75,9 @@ impl Default for UpstreamConfig {
     }
 }
 
-// 仅供 service crate 内部使用（`upstream::feed_sim::FeedSimUpstream::new`）。
-// 全 crate 唯一一处构造 `feed_sim::SubscriberConfig` —— 边界类型不外泄的密封点。
+// For service-crate internal use only (`upstream::feed_sim::FeedSimUpstream::new`).
+// The single place in the entire crate that constructs `feed_sim::SubscriberConfig` —
+// the sealing point that keeps the boundary type from leaking.
 impl From<UpstreamConfig> for SubscriberConfig {
     fn from(c: UpstreamConfig) -> Self {
         SubscriberConfig {
@@ -92,32 +100,38 @@ impl From<UpstreamConfig> for SubscriberConfig {
 // ServiceConfig
 // ---------------------------------------------------------------------------
 
-/// 整个 service 的启动配置。
+/// Top-level startup configuration for the service.
 #[derive(Debug, Clone)]
 pub struct ServiceConfig {
-    /// 上游 feed 配置。
+    /// Upstream feed configuration.
     pub upstream: UpstreamConfig,
 
-    /// Ingest 线程对 `Upstream::wait` 的 poll 间隔。
-    /// 太长 → 关闭信号延迟；太短 → 空转。50ms 是一个保守默认。
+    /// Poll interval for the ingest thread's `Upstream::wait`. Too long
+    /// → shutdown signal is delayed; too short → busy-looping. 50ms is
+    /// a conservative default.
     pub poll_interval: Duration,
 
-    /// 每个 FIGI 的 `tokio::sync::broadcast` 容量。
-    /// 满了 broadcast 自动丢最旧，订阅者下次 `recv` 会拿到 `Lagged(n)`，
-    /// 由 `Bus` 的 fan-in task 累进 `dropped_total`。
+    /// Per-FIGI `tokio::sync::broadcast` capacity. When full, broadcast
+    /// automatically drops the oldest entry; the subscriber's next
+    /// `recv` returns `Lagged(n)`, and the `Bus` fan-in task
+    /// accumulates this into `dropped_total`.
     pub bus_channel_capacity: usize,
 
-    /// 每个订阅者 fan-in mpsc 的容量。gRPC handler 在 wire 阶段也用此 channel,
-    /// 满即丢 + 累进 `dropped_total`。
+    /// Per-subscriber fan-in mpsc capacity. The gRPC handler reuses
+    /// this channel for the wire stage as well; full = drop + increment
+    /// `dropped_total`.
     pub subscriber_queue_size: usize,
 
-    /// Ingest 每 N 笔在 stderr 打一次进度（0 = 关）。仅用于 demo 输出。
+    /// Ingest prints a progress line to stderr every N messages (0 =
+    /// off). Demo output only.
     pub progress_log_every: u64,
 
-    /// gRPC server 监听地址。默认 `0.0.0.0:50051`,同主机 + 跨主机两用。
+    /// gRPC server listen address. Default `0.0.0.0:50051`, suitable for
+    /// both same-host and cross-host use.
     ///
-    /// **不要**改成 `127.0.0.1:50051` —— 那样 LAN client 连不通,违反题面
-    /// "Works for clients on the same host and on a remote machine"。
+    /// **Do not** change this to `127.0.0.1:50051` — that breaks LAN
+    /// clients and violates the assignment's "Works for clients on the
+    /// same host and on a remote machine".
     pub listen_addr: SocketAddr,
 }
 
@@ -129,22 +143,23 @@ impl Default for ServiceConfig {
             bus_channel_capacity: 1024,
             subscriber_queue_size: 1024,
             progress_log_every: 100,
-            // 0.0.0.0 而非 127.0.0.1 —— 跨主机连入是题面硬要求。
+            // 0.0.0.0 rather than 127.0.0.1 — cross-host connections are
+            // a hard assignment requirement.
             listen_addr: "0.0.0.0:50051".parse().expect("hardcoded addr valid"),
         }
     }
 }
 
 impl ServiceConfig {
-    /// 从环境变量加载。
+    /// Load configuration from environment variables.
     ///
-    /// | Env | 字段 | 默认 |
+    /// | Env | Field | Default |
     /// |---|---|---|
     /// | `SIM_INSTRUMENTS` | `upstream.instruments` | 100 |
     /// | `SIM_RATE_HZ` | `upstream.rate_hz` | 1000 |
     /// | `SIM_DEPTH` | `upstream.depth` | 5 |
-    /// | `SIM_MAX_MESSAGES` | `upstream.max_messages` | 无限 |
-    /// | `SIM_SEED` | `upstream.seed` | 固定 |
+    /// | `SIM_MAX_MESSAGES` | `upstream.max_messages` | unlimited |
+    /// | `SIM_SEED` | `upstream.seed` | fixed |
     /// | `SIM_START_SEQ` | `upstream.start_seq` | 1 |
     /// | `SIM_BUFFER_SIZE` | `upstream.buffer_size` | 1024 |
     /// | `SIM_PACING` | `upstream.burst_size` | steady |
@@ -204,7 +219,8 @@ impl ServiceConfig {
         Ok(cfg)
     }
 
-    /// 校验本层不变量。feed-sim 自己也会再校验一次（fail-fast 两道防线）。
+    /// Validate this layer's invariants. feed-sim validates again on its
+    /// own (fail-fast in two layers of defense).
     pub fn validate(&self) -> Result<(), BoxError> {
         if self.bus_channel_capacity == 0 {
             return Err("bus_channel_capacity must be > 0".into());
@@ -237,7 +253,7 @@ where
     }
 }
 
-/// `steady` / `bursty:N`（与 feed-sim 的 SIM_PACING 兼容）。
+/// `steady` / `bursty:N` (compatible with feed-sim's SIM_PACING).
 fn parse_pacing(s: &str) -> Result<Option<u32>, BoxError> {
     let s = s.trim();
     if s.eq_ignore_ascii_case("steady") {
@@ -279,8 +295,9 @@ mod tests {
         assert!(cfg.validate().is_err());
     }
 
-    /// 与 `bus_channel_capacity` / `poll_interval` 对称覆盖,避免「validate 加
-    /// 了 check 但没测试守护」的 silent gap。
+    /// Symmetric coverage with `bus_channel_capacity` / `poll_interval`,
+    /// avoiding the silent gap where "validate gained a check but no
+    /// test guards it".
     #[test]
     fn rejects_zero_subscriber_queue_size() {
         let cfg = ServiceConfig {

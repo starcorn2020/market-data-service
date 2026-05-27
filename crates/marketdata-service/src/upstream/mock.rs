@@ -14,13 +14,13 @@ use super::Upstream;
 // ---------------------------------------------------------------------------
 
 struct Inner {
-    /// 待消费消息队列；MockHandle::push 入队，Upstream::receive 出队。
+    /// Pending-message queue; MockHandle::push enqueues, Upstream::receive dequeues.
     queue: Mutex<VecDeque<BookMessage>>,
-    /// `Upstream::wait` 阻塞在此；push / close 时被 notify。
+    /// `Upstream::wait` blocks here; push / close notifies.
     cv: Condvar,
-    /// `MockHandle::close()` 设为 true，标志"上游永久结束"。
+    /// Set to true by `MockHandle::close()`, signaling "upstream has ended permanently".
     closed: AtomicBool,
-    /// 累计 push 数（成功入队的，对应 Upstream::total_generated）。
+    /// Cumulative successful pushes (matches Upstream::total_generated).
     total: AtomicU64,
 }
 
@@ -28,24 +28,26 @@ struct Inner {
 // MockUpstream
 // ---------------------------------------------------------------------------
 
-/// 测试用 [`Upstream`] 实作。配套 [`MockHandle`] 控制数据流。
+/// Test-only [`Upstream`] implementation. Paired with [`MockHandle`] for
+/// data-flow control.
 ///
-/// 典型用法：
+/// Typical usage:
 ///
 /// ```ignore
 /// let (upstream, handle) = MockUpstream::new();
 /// let service = Service::new_with_upstream(cfg, upstream)?;
 /// handle.push(make_book(figi, 1));
 /// handle.push(make_book(figi, 2));
-/// handle.close();      // 让 ingest 自然 EOF
+/// handle.close();      // let ingest reach natural EOF
 /// ```
 pub struct MockUpstream {
     inner: Arc<Inner>,
 }
 
 impl MockUpstream {
-    /// 构造一对 (`MockUpstream`, `MockHandle`)：前者 move 进 service / ingest,
-    /// 后者由测试持有以控制数据流。
+    /// Construct a (`MockUpstream`, `MockHandle`) pair: the former is
+    /// moved into service / ingest, the latter is retained by the test
+    /// to control the data flow.
     pub fn new() -> (Self, MockHandle) {
         let inner = Arc::new(Inner {
             queue: Mutex::new(VecDeque::new()),
@@ -67,11 +69,12 @@ impl Upstream for MockUpstream {
         Ok(self.inner.queue.lock().unwrap().pop_front())
     }
 
-    /// 阻塞最多 `duration`；提前唤醒条件：push / close。
+    /// Blocks for at most `duration`; wakes early on push / close.
     ///
-    /// 返回 `Err(())` 仅当 closed **且** queue 排空 —— 与 feed-sim 的
-    /// "唯一合法的结束信号" 语义对齐, 保证 ingest_loop 的 EOF 判定逻辑
-    /// 在 mock 路径与真实 upstream 路径上行为一致。
+    /// Returns `Err(())` only when closed **and** queue is drained —
+    /// matches feed-sim's "the only legitimate end signal" semantics,
+    /// so the ingest_loop EOF decision behaves identically on the mock
+    /// path and the real upstream path.
     fn wait(&self, duration: Duration) -> Result<(), ()> {
         let inner = &*self.inner;
         let guard = inner.queue.lock().unwrap();
@@ -83,13 +86,15 @@ impl Upstream for MockUpstream {
             return Err(());
         }
 
-        // queue 空 + 未 close → 在 condvar 上等待 push / close 或超时。
+        // Queue is empty and not closed → wait on the condvar for
+        // push / close or timeout.
         let (guard, _timeout) = inner.cv.wait_timeout(guard, duration).unwrap();
 
         if guard.is_empty() && inner.closed.load(Ordering::Acquire) {
             Err(())
         } else {
-            // 任一情况都让外层回去 try receive：要么有数据，要么 spurious wakeup。
+            // Either case sends the caller back to try a receive: either
+            // there is data, or this was a spurious wakeup.
             Ok(())
         }
     }
@@ -103,26 +108,29 @@ impl Upstream for MockUpstream {
 // MockHandle
 // ---------------------------------------------------------------------------
 
-/// 测试侧句柄：往 [`MockUpstream`] 推消息、关闭上游。
+/// Test-side handle: push messages into [`MockUpstream`] and close the upstream.
 ///
-/// `Clone` 可分发给多个生产者任务（典型场景：subscribe 期间另起 tokio task
-/// 持续 push）。
+/// `Clone`able for distribution to multiple producer tasks (typical
+/// scenario: a separate tokio task that keeps pushing during a
+/// subscribe).
 #[derive(Clone)]
 pub struct MockHandle {
     inner: Arc<Inner>,
 }
 
 impl MockHandle {
-    /// 入队一笔。每次唤醒一个等待中的 `wait` 调用。
+    /// Enqueue one message. Each call wakes one waiting `wait` call.
     pub fn push(&self, book: BookMessage) {
         self.inner.queue.lock().unwrap().push_back(book);
         self.inner.total.fetch_add(1, Ordering::Relaxed);
         self.inner.cv.notify_one();
     }
 
-    /// 标志上游永久结束。一旦 queue 排空，下一个 `wait` 返回 `Err(())`。
+    /// Signal that the upstream has ended permanently. Once the queue
+    /// drains, the next `wait` returns `Err(())`.
     ///
-    /// 唤醒所有 wait（队列可能仍有数据，让 ingest 把剩余 drain 干净）。
+    /// Wakes all waits (the queue may still have data, so ingest can
+    /// drain the remainder).
     pub fn close(&self) {
         self.inner.closed.store(true, Ordering::Release);
         self.inner.cv.notify_all();
@@ -131,7 +139,8 @@ impl MockHandle {
 
 #[cfg(test)]
 impl MockHandle {
-    /// 测试用 helper:累计 push 笔数, 与 `Upstream::total_generated()` 互校。
+    /// Test-only helper: cumulative push count, used to cross-check
+    /// against `Upstream::total_generated()`.
     pub(crate) fn total_pushed(&self) -> u64 {
         self.inner.total.load(Ordering::Relaxed)
     }
@@ -141,9 +150,11 @@ impl MockHandle {
 // Test helpers (production-visible, intentional)
 // ---------------------------------------------------------------------------
 
-/// 构造一个最小有效 [`BookMessage`]，供测试快速生成数据流。
+/// Build a minimally valid [`BookMessage`] for tests to quickly produce a
+/// data flow.
 ///
-/// `figi` 长度 > 12 字符会截断（`Figi::from_str` 的语义）。
+/// `figi` longer than 12 characters is truncated (per `Figi::from_str`
+/// semantics).
 pub fn make_book(figi: &str, gateway_seq: u64) -> BookMessage {
     BookMessage {
         figi: figi.parse().expect("Figi::from_str is Infallible"),
@@ -158,16 +169,17 @@ pub fn make_book(figi: &str, gateway_seq: u64) -> BookMessage {
 
 #[cfg(test)]
 mod tests {
-    //! `MockUpstream` 自身正确性测试 ("测试的测试")。
+    //! Correctness tests for `MockUpstream` itself ("tests for the test").
     //!
-    //! 守的契约 (与 [`super::Upstream`] trait 的实作语义一一对应):
+    //! Contracts guarded (1:1 with the implementation semantics of the
+    //! [`super::Upstream`] trait):
     //!
-    //! | 测试 | 守的契约 |
+    //! | Test | Contract |
     //! |---|---|
-    //! | `push_then_receive_in_fifo_order` | `receive` 是 FIFO + 排空后返 `Ok(None)` |
-    //! | `wait_returns_err_after_close_and_drain` | 与 feed-sim 一致:**closed 且 queue 空**才返 `Err(())` —— 唯一合法的 EOF 信号 |
-    //! | `wait_wakes_up_on_push` | condvar 唤醒生效:push 后 ≤200ms 内唤醒, **不是** poll-sleep 假冒 |
-    //! | `total_generated_tracks_pushes` | 累计计数等于 push 次数 (对应 `Upstream::total_generated`) |
+    //! | `push_then_receive_in_fifo_order` | `receive` is FIFO and returns `Ok(None)` after drain |
+    //! | `wait_returns_err_after_close_and_drain` | Matches feed-sim: only returns `Err(())` when **closed and queue is empty** — the only legitimate EOF signal |
+    //! | `wait_wakes_up_on_push` | condvar wakeup works: woken within ≤200ms of push, **not** poll-sleep in disguise |
+    //! | `total_generated_tracks_pushes` | Cumulative count equals push count (matches `Upstream::total_generated`) |
 
     use super::*;
     use std::thread;
@@ -190,10 +202,10 @@ mod tests {
         h.push(make_book("BBG000000001", 1));
         h.close();
 
-        // 有数据 → Ok
+        // Has data → Ok
         assert!(up.wait(Duration::from_millis(50)).is_ok());
         let _ = up.receive().unwrap();
-        // 排空 + closed → Err
+        // Drained + closed → Err
         assert!(up.wait(Duration::from_millis(50)).is_err());
     }
 
@@ -206,7 +218,7 @@ mod tests {
             h.push(make_book("BBG000000001", 1));
         });
 
-        // 即使 wait 给了 1s 超时，push 后 20ms 内就应该被唤醒。
+        // Even though wait has a 1s timeout, push should wake it within ~20ms.
         let res = up.wait(Duration::from_secs(1));
         let elapsed = start.elapsed();
         assert!(res.is_ok());

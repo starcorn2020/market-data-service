@@ -1,19 +1,27 @@
 //! gRPC service implementation.
 //!
-//! 把 [`crate::snapshot::Snapshot`] 与 [`crate::bus::Bus`] 包装成 tonic
-//! `MarketData` service。
+//! Wraps [`crate::snapshot::Snapshot`] and [`crate::bus::Bus`] as a tonic
+//! `MarketData` service.
 //!
-//! # 设计要点
+//! # Design notes
 //!
-//! - `GetSnapshot` 是 unary RPC：直接读 [`Snapshot::get`]；`None` → `NotYet`,
-//!   `Some` → `Found(Book)` —— 即题面要求的 "clearly-defined no data yet"。
-//! - `Subscribe` 是 server-streaming, wire 端 **严禁 `send().await`**：任何 await
-//!   都会让慢 client 反压到 fan-in, 再回压 ingest, 违反 "ingest 永不阻塞" 不
-//!   变量。本档统一用 `try_send`, 满了直接丢 + 累进 `dropped_total`。
-//! - wire 阶段 `try_send` 与 fan-in 阶段共用同一个 `dropped` 计数器
-//!   (`Subscription::dropped_counter`), 所以 `BookUpdate.dropped_total` 是
-//!   "fan-in 丢" + "wire 丢" 的全链路累积值。
-//! - `BookMessage ↔ proto::Book` 的转换是纯机械映射, 集中放在本档底部。
+//! - `GetSnapshots` is a unary RPC that takes a batch of FIGIs and returns
+//!   one `SnapshotEntry` per FIGI in request order. Each entry maps to
+//!   [`Snapshot::get`]: `None` → `NotYet`, `Some` → `Found(Book)` —
+//!   exactly the "clearly-defined no data yet" required by the assignment.
+//!   No cross-FIGI atomicity: per-entry reads against the underlying
+//!   DashMap, semantically identical to issuing N parallel single-FIGI lookups.
+//! - `Subscribe` is server-streaming. On the wire side, **`send().await`
+//!   is strictly forbidden**: any `await` would let a slow client back-
+//!   pressure into fan-in and then into ingest, violating the
+//!   "ingest never blocks" invariant. This file uses `try_send`
+//!   exclusively, dropping on full and incrementing `dropped_total`.
+//! - The wire stage `try_send` and the fan-in stage share the same
+//!   `dropped` counter (`Subscription::dropped_counter`), so
+//!   `BookUpdate.dropped_total` is the cumulative end-to-end count of
+//!   "fan-in drops" + "wire drops".
+//! - The `BookMessage ↔ proto::Book` conversion is a pure mechanical
+//!   mapping; it lives at the bottom of this file.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -31,33 +39,39 @@ use crate::snapshot::Snapshot;
 // Generated proto module
 // ---------------------------------------------------------------------------
 
-/// `tonic-build` 输出在 `$OUT_DIR/marketdata.v1.rs`，由 build.rs 触发；
-/// 这里 inline pull-in，避免 IDE 找不到。
+/// `tonic-build` emits `$OUT_DIR/marketdata.v1.rs`, triggered by build.rs;
+/// we inline-include it here so the IDE can find it.
 ///
-/// `#![allow(missing_docs)]`：proto 注释由 tonic-build 自动转 doc-comment，
-/// 但 `derive(Message)` 的 boilerplate 字段不会带 docs；service crate 顶层
-/// 用 `#![warn(missing_docs)]` 严格要求，对生成代码必须豁免。
+/// `#![allow(missing_docs)]`: proto comments are turned into doc-comments
+/// by tonic-build automatically, but the `derive(Message)` boilerplate
+/// fields are not documented; the service crate enforces
+/// `#![warn(missing_docs)]` at the top level, so generated code must be
+/// exempted.
 pub mod pb {
     #![allow(missing_docs)]
     tonic::include_proto!("marketdata.v1");
 }
 
 pub use pb::market_data_server::{MarketData, MarketDataServer};
-use pb::snapshot_response::Result as SnapshotResult;
+use pb::snapshot_entry::Result as SnapshotResult;
 use pb::{
-    Book, BookUpdate, GetSnapshotRequest, Level, NotYet, SnapshotResponse, SubscribeRequest,
+    Book, BookUpdate, GetSnapshotsRequest, GetSnapshotsResponse, Level, NotYet, SnapshotEntry,
+    SubscribeRequest,
 };
 
 // ---------------------------------------------------------------------------
 // Service impl
 // ---------------------------------------------------------------------------
 
-/// `tonic::Server::add_service(MarketDataServer::new(MarketDataService { ... }))` 用的实体。
+/// The concrete type passed to
+/// `tonic::Server::add_service(MarketDataServer::new(MarketDataService { ... }))`.
 pub struct MarketDataService {
     snapshot: Arc<Snapshot>,
     bus: Arc<Bus>,
-    /// Wire 端 mpsc 的容量。tonic server-streaming 默认会把背压传回 producer,
-    /// 这里靠 `try_send` 切断;容量决定 client 短暂 lag 时的容忍度。
+    /// Capacity of the wire-side mpsc. Tonic server-streaming would
+    /// otherwise propagate back-pressure to the producer; we sever that
+    /// via `try_send`, and capacity determines how much short-term lag
+    /// we tolerate from the client.
     subscriber_queue_size: usize,
 }
 
@@ -77,38 +91,61 @@ impl MarketDataService {
 
 #[tonic::async_trait]
 impl MarketData for MarketDataService {
-    async fn get_snapshot(
+    // `tonic::Status` is ~176 bytes; clippy's `result_large_err` flags
+    // `Result<_, Status>` as too large. This is the standard tonic handler
+    // error type and matches the signature on `subscribe` below.
+    #[allow(clippy::result_large_err)]
+    async fn get_snapshots(
         &self,
-        request: Request<GetSnapshotRequest>,
-    ) -> Result<Response<SnapshotResponse>, Status> {
-        let figi_str = request.into_inner().figi;
-        // `Figi::from_str` 在 upstream 是 Infallible —— 长度 > 12 byte 会 silently
-        // 截断而非报错。wire 层显式拒绝过长 figi, 避免客户端送 "BBG_LONG_FIGI"
-        // 被切成前 12 byte 后大概率返 NotYet 的诡异 UX。
-        if figi_str.len() > 12 {
-            return Err(Status::invalid_argument(format!(
-                "figi too long ({} bytes, max 12)",
-                figi_str.len()
-            )));
+        request: Request<GetSnapshotsRequest>,
+    ) -> Result<Response<GetSnapshotsResponse>, Status> {
+        let figi_strs = request.into_inner().figis;
+        if figi_strs.is_empty() {
+            return Err(Status::invalid_argument(
+                "get_snapshots with empty figi list",
+            ));
         }
-        let figi: Figi = figi_str
-            .parse()
-            .expect("Figi::from_str is Infallible; length already bounded above");
 
-        let result = match self.snapshot.get(&figi) {
-            Some(book) => SnapshotResult::Found(book_to_proto(&book)),
-            None => SnapshotResult::NotYet(NotYet {}),
-        };
-        Ok(Response::new(SnapshotResponse {
-            result: Some(result),
-        }))
+        // All-or-nothing validation, mirroring `subscribe`: any oversized
+        // figi in the batch rejects the entire request. `Figi::from_str`
+        // is `Infallible` upstream — input longer than 12 bytes is
+        // silently truncated rather than rejected — so the wire layer
+        // explicitly rejects overly long figis to avoid the confusing UX
+        // where "BBG_LONG_FIGI" is sliced to 12 bytes and almost
+        // certainly returns NotYet.
+        let mut entries = Vec::with_capacity(figi_strs.len());
+        for s in figi_strs {
+            if s.len() > 12 {
+                return Err(Status::invalid_argument(format!(
+                    "figi too long ({} bytes, max 12): {s}",
+                    s.len()
+                )));
+            }
+            let figi: Figi = s
+                .parse()
+                .expect("Figi::from_str is Infallible; length already bounded above");
+            let result = match self.snapshot.get(&figi) {
+                Some(book) => SnapshotResult::Found(book_to_proto(&book)),
+                None => SnapshotResult::NotYet(NotYet {}),
+            };
+            // Echo the original figi string so the client does not depend
+            // on response order to match a result back to a request entry.
+            entries.push(SnapshotEntry {
+                figi: s,
+                result: Some(result),
+            });
+        }
+
+        Ok(Response::new(GetSnapshotsResponse { entries }))
     }
 
     type SubscribeStream = ReceiverStream<Result<BookUpdate, Status>>;
 
-    // `tonic::Status` ~176 bytes,clippy `result_large_err` 提示 `Result<_, Status>`
-    // 偏大。这是 tonic handler 的标准错误型别;改 `Box<Status>` 会破坏 tonic 的
-    // wire 契约,且 figi parse 失败属于罕见路径,size 优化无意义。
+    // `tonic::Status` is ~176 bytes; clippy's `result_large_err` flags
+    // `Result<_, Status>` as too large. This is the standard tonic
+    // handler error type; switching to `Box<Status>` would break tonic's
+    // wire contract, and figi-parse failures are a rare path, so size
+    // optimization is pointless.
     #[allow(clippy::result_large_err)]
     async fn subscribe(
         &self,
@@ -119,10 +156,13 @@ impl MarketData for MarketDataService {
             return Err(Status::invalid_argument("subscribe with empty figi list"));
         }
 
-        // String → Figi 转换。单条解析失败即拒绝整个请求 (all-or-nothing) —— 比
-        // "默默丢掉非法 figi 只订阅剩下的" 语义更清晰, 调用方不会得到漏订阅但
-        // 状态码 OK 的 silent 失败。`Figi::from_str` 本身 Infallible (silently
-        // 截断), wire 层显式拒长 figi 避免诡异 UX。
+        // String → Figi conversion. If any single entry fails to parse we
+        // reject the entire request (all-or-nothing) — this has clearer
+        // semantics than "silently drop the bad figi and subscribe to the
+        // rest", which would give the caller a partially-missing
+        // subscription with an OK status code. `Figi::from_str` is
+        // Infallible (silently truncates); the wire layer explicitly
+        // rejects overly long figis to avoid that confusing UX.
         let figis: Vec<Figi> = figi_strs
             .into_iter()
             .map(|s| -> Result<Figi, Status> {
@@ -137,27 +177,39 @@ impl MarketData for MarketDataService {
             })
             .collect::<Result<_, _>>()?;
 
-        // 在 bus 上开订阅（这一步内部 spawn N 个 fan-in task）。
+        // Open the subscription on the bus (this internally spawns N
+        // fan-in tasks).
         let mut sub = self.bus.subscribe(&figis, self.subscriber_queue_size);
 
-        // 共享 dropped 计数：fan-in 阶段(bus.rs) 与 wire 阶段(本档下方 spawn)
-        // 都 fetch_add 到这同一个 AtomicU64。Client 看到的累积值涵盖"全链路丢"。
+        // Shared dropped counter: the fan-in stage (bus.rs) and the wire
+        // stage (the spawn below) both fetch_add into this same
+        // AtomicU64. The cumulative value the client sees covers
+        // "end-to-end drops".
         let dropped = sub.dropped_counter();
 
-        // Wire 端 mpsc：tonic 的 ReceiverStream 即从此 Receiver pull。
-        // 容量与 fan-in 端独立 —— fan-in 满会丢；wire 满也会丢；二者共同进 dropped。
+        // Wire-side mpsc: tonic's ReceiverStream pulls from this
+        // Receiver. Capacity is independent of the fan-in side — fan-in
+        // drops on full, wire drops on full, and both feed the same
+        // `dropped` counter.
         let (out_tx, out_rx) =
             mpsc::channel::<Result<BookUpdate, Status>>(self.subscriber_queue_size);
 
-        // wire-pump task:从 fan-in mpsc 拉一笔,搬到 wire mpsc 让 tonic 推给 client。
+        // wire-pump task: pulls one message from the fan-in mpsc and
+        // hands it to the wire mpsc, which tonic then pushes to the
+        // client.
         //
-        // 双臂 select!:
-        //   - 主臂 `sub.next()`:有新 update 时正常推流;
-        //   - 副臂 `out_tx.closed()`:client 断线时立刻退出,避免「该 figi 久无 publish
-        //     时本 task 卡在 sub.next() 直到下一笔 publish 才走 Closed」的潜在 task
-        //     泄漏(成本极小,但语义不干净)。
-        // 双臂均 cancel-safe(`mpsc::Receiver::recv` / `mpsc::Sender::closed` tokio
-        // 文档明示),loop 每次重新 register interest,无 starvation。
+        // Two-armed select!:
+        //   - Primary arm `sub.next()`: pushes on new updates;
+        //   - Secondary arm `out_tx.closed()`: exits immediately when the
+        //     client disconnects, preventing a potential task leak in
+        //     the scenario where "the figi has no publish for a long
+        //     time, so this task is parked on sub.next() and only sees
+        //     Closed at the next publish" (cost is tiny, but the
+        //     semantics are unclean).
+        // Both arms are cancel-safe (`mpsc::Receiver::recv` /
+        // `mpsc::Sender::closed` are documented as such by tokio); the
+        // loop re-registers interest each iteration, and there is no
+        // starvation.
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -165,22 +217,30 @@ impl MarketData for MarketDataService {
                         let Some(book) = book else { break };
                         let upd = BookUpdate {
                             book: Some(book_to_proto(&book)),
-                            // `load(Relaxed)` 可能滞后 fan-in 端 `fetch_add` 一
-                            // 刹那 —— 多个 fan_in_one task 并发 add, 本 task 单
-                            // load。benign:dropped_total 是累积值, 此次 sample
-                            // 漏掉的下一笔 BookUpdate 必体现, 最终累积值正确。
+                            // `load(Relaxed)` may briefly lag the
+                            // fan-in side's `fetch_add` — multiple
+                            // fan_in_one tasks add concurrently while
+                            // this single task loads. Benign:
+                            // dropped_total is cumulative, so anything
+                            // missed by this sample will appear in the
+                            // next BookUpdate; the final cumulative
+                            // value is correct.
                             dropped_total: dropped.load(Ordering::Relaxed),
                         };
-                        // ★ 必须 try_send, 不能 await。任何 await 都会让慢 client
-                        //   反压到 fan-in, 再回压 ingest, 违反 "ingest 永不阻塞"
-                        //   不变量 —— 整个 service 设计的硬约束。
+                        // ★ Must use try_send; await is forbidden. Any
+                        //   await would let a slow client back-pressure
+                        //   into fan-in and then into ingest, violating
+                        //   the "ingest never blocks" invariant — a hard
+                        //   constraint of the entire service design.
                         match out_tx.try_send(Ok(upd)) {
                             Ok(()) => {}
                             Err(TrySendError::Full(_)) => {
                                 dropped.fetch_add(1, Ordering::Relaxed);
                             }
                             Err(TrySendError::Closed(_)) => {
-                                // 与副臂 out_tx.closed() 等价路径;client 已断,兜底退出。
+                                // Equivalent to the secondary arm
+                                // out_tx.closed(); client is gone,
+                                // exit as the safety net.
                                 break;
                             }
                         }
@@ -188,18 +248,26 @@ impl MarketData for MarketDataService {
                     _ = out_tx.closed() => break,
                 }
             }
-            // 三条退出路径都到这里,drop 语义按路径不同:
-            //   - 副臂 out_tx.closed() / 主臂 try_send Closed:out_tx 已 closed,
-            //     drop 冗余但无害;
-            //   - 主臂 sub.next() 返 None(fan-in mpsc 关闭,e.g. bus 被 drop):
-            //     out_tx 仍 open,**必须** drop 让 client 看到 stream end 而非 hang。
+            // All three exit paths arrive here; drop semantics differ
+            // by path:
+            //   - Secondary arm out_tx.closed() / primary arm try_send
+            //     Closed: out_tx is already closed, drop is redundant
+            //     but harmless;
+            //   - Primary arm sub.next() returning None (fan-in mpsc
+            //     closed, e.g. bus has been dropped): out_tx is still
+            //     open, so we **must** drop it for the client to see
+            //     a stream end rather than hang.
             //
-            // 关于 `Result<BookUpdate, Status>` 的 Status arm:
-            // tonic server-streaming 约定 stream item 是 Result<T, Status>,即使我们
-            // 只送 Ok,签名也无法省 Status arm。本档不主动发 mid-stream Err ——
-            // client 断线由 tonic transport 层(HTTP/2 RST_STREAM)直接告知,无需
-            // service 介入;未来若加 graceful shutdown 想推一笔 Status::Cancelled
-            // 给所有订阅者,此处即注入点。
+            // About the Status arm of `Result<BookUpdate, Status>`:
+            // tonic server-streaming requires stream items to be
+            // Result<T, Status>, so even though we only send Ok, we
+            // cannot drop the Status arm from the signature. This file
+            // does not actively emit a mid-stream Err — client
+            // disconnects are signaled by the tonic transport layer
+            // (HTTP/2 RST_STREAM) directly, no service intervention
+            // needed; if a future graceful shutdown wants to push a
+            // Status::Cancelled to all subscribers, this is the
+            // injection point.
             drop(out_tx);
         });
 
@@ -211,13 +279,15 @@ impl MarketData for MarketDataService {
 // Conversion: marketdata_types::BookMessage  <->  proto Book
 // ---------------------------------------------------------------------------
 
-/// 把 service 内部 `BookMessage` 映射到 wire `Book`。
+/// Map the service-internal `BookMessage` to the wire `Book`.
 ///
-/// 注意：
-/// - `Figi` 是 `[u8; 12]` (NUL-padded)，调用 `as_str()` 即可自动 trim。
-/// - 只输出 `bid_count` / `ask_count` 内的有效 levels (upstream 契约:数组其余
-///   位置是 `BookLevel::default()` 占位, 不应进 wire)。`BookLevel` 是 `Copy`,
-///   但 proto `Level` 没有 `From<BookLevel>` —— 一行 lambda 转完。
+/// Notes:
+/// - `Figi` is `[u8; 12]` (NUL-padded); calling `as_str()` auto-trims.
+/// - Only emit the active levels within `bid_count` / `ask_count`
+///   (upstream contract: the remaining array slots are `BookLevel::default()`
+///   placeholders and must not enter the wire). `BookLevel` is `Copy`,
+///   but proto `Level` does not implement `From<BookLevel>` — a one-line
+///   lambda does the conversion.
 fn book_to_proto(msg: &BookMessage) -> Book {
     Book {
         figi: msg.figi.as_str().to_string(),
@@ -242,21 +312,26 @@ fn level_to_proto(level: &marketdata_types::BookLevel) -> Level {
 
 #[cfg(test)]
 mod tests {
-    //! grpc.rs 测试分层:
+    //! grpc.rs test layering:
     //!
-    //! - **本档 (unit)**: 只测**纯转换函数** `book_to_proto` —— `BookMessage`
-    //!   是 `Copy`, 转 proto 不涉及 IO / spawn / runtime, 适合 deterministic
-    //!   单测。
-    //! - **`tests/grpc_basic.rs` (integration)**: 覆盖 handler 在真 gRPC wire
-    //!   上的行为 —— `GetSnapshot` NotYet/Found 切换、`Subscribe` 推流、空
-    //!   figi / too-long figi 被拒绝。
-    //! - **`tests/grpc_slow_consumer.rs` (`#[ignore]` 手动)**: wire 层慢消费者
-    //!   隔离的压力测试 —— 证明 wire 路径也守得住 "ingest 不阻塞" 不变量。
+    //! - **This file (unit)**: only tests the **pure conversion function**
+    //!   `book_to_proto` — `BookMessage` is `Copy`, the conversion
+    //!   involves no IO / spawn / runtime, and is well suited to
+    //!   deterministic unit testing.
+    //! - **`tests/grpc_basic.rs` (integration)**: covers handler behavior
+    //!   on a real gRPC wire — `GetSnapshots` NotYet/Found switching and
+    //!   batch shape, `Subscribe` streaming, empty figi / too-long figi
+    //!   rejection.
+    //! - **`tests/grpc_slow_consumer.rs` (`#[ignore]`, manual)**: stress
+    //!   test for wire-layer slow-consumer isolation — proves that the
+    //!   wire path also honors the "ingest never blocks" invariant.
     //!
-    //! 不在本档加 handler unit test 的理由:`MarketData::*` 是 `async fn` +
-    //! `Request<T>`, 直接 unit 测要么 mock 太多 (失去信号), 要么本质上重写
-    //! integration 流程 (重复成本)。让 integration 层守 handler 逻辑、unit 层
-    //! 守纯函数, 分工更干净。
+    //! We deliberately do not add handler unit tests here: `MarketData::*`
+    //! is `async fn` + `Request<T>`; unit-testing it either requires too
+    //! many mocks (weak signal) or essentially rewrites the integration
+    //! flow (high duplication). Let integration tests guard handler
+    //! logic and let unit tests guard pure functions — cleaner division
+    //! of labor.
 
     use super::*;
 
@@ -309,11 +384,12 @@ mod tests {
 
     #[test]
     fn book_to_proto_trims_to_active_levels_only() {
-        // bid_count=2 但 bids 数组有 10 slot —— proto Book 必须只带 2 个。
+        // bid_count=2 but the bids array has 10 slots — the proto Book
+        // must carry only 2.
         let m = sample_book();
         let pb = book_to_proto(&m);
         assert_eq!(pb.bids.len(), 2);
-        // 后 8 个 BookLevel::default() 不应进 wire。
+        // The trailing 8 `BookLevel::default()` slots must not reach the wire.
     }
 
     #[test]
