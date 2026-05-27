@@ -103,6 +103,12 @@ impl Bus {
 /// 终止条件：
 /// - mpsc 端被 client 主动 drop → `TrySendError::Closed` → return
 /// - broadcast 端无 sender → `RecvError::Closed` → return
+///
+/// # Log 策略（Phase 4 切 tracing 时统一替换）
+///
+/// 只在 4 条**错误/状态变化**分支打 `eprintln!`，正常路径（每笔 Ok→Ok）零开销。
+/// `TrySendError::Full` 持续满时会每笔都触发，用 `is_power_of_two` 做对数级
+/// 自抑制，避免 stderr 刷屏。
 async fn fan_in_one(
     mut bc_rx: broadcast::Receiver<BookMessage>,
     tx: mpsc::Sender<BookMessage>,
@@ -114,20 +120,39 @@ async fn fan_in_one(
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     // 订阅者 mpsc 满 → 丢这笔 + 累进 dropped_total（I2）。
-                    dropped.fetch_add(1, Ordering::Relaxed);
+                    // fetch_add 返回 +1 前的旧值，所以新值 = prev + 1。
+                    let prev = dropped.fetch_add(1, Ordering::Relaxed);
+                    let now = prev + 1;
+                    eprintln!(
+                        "[bus] subscriber mpsc full, dropped_total={now}"
+                    );
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     // 订阅者已断；fan-in task 退出。
+                    eprintln!(
+                        "[bus] subscriber disconnected, fan-in task exiting \
+                         (dropped_total={})",
+                        dropped.load(Ordering::Relaxed),
+                    );
                     return;
                 }
             },
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 // broadcast ring buffer 覆盖了 n 笔（ingest 发得比 fan-in 快）。
                 // 不当作错误，记进 dropped_total 继续。
-                dropped.fetch_add(n, Ordering::Relaxed);
+                let prev = dropped.fetch_add(n, Ordering::Relaxed);
+                eprintln!(
+                    "[bus] broadcast lagged: missed={n} dropped_total={}",
+                    prev + n,
+                );
             }
             Err(broadcast::error::RecvError::Closed) => {
                 // bus 自身被 drop（service 关闭）。退出。
+                eprintln!(
+                    "[bus] broadcast closed, fan-in task exiting \
+                     (dropped_total={})",
+                    dropped.load(Ordering::Relaxed),
+                );
                 return;
             }
         }
@@ -179,7 +204,41 @@ impl Subscription {
 
 #[cfg(test)]
 mod tests {
+    //! Bus / Subscription / fan_in_one 单元测试。
+    //!
+    //! # 组织方式
+    //!
+    //! 测试按"守的不变量"分区,reviewer 顺序读完即可建立完整 bus.rs 行为认知:
+    //!
+    //! | 分区 | 守的契约 | 测试 |
+    //! |---|---|---|
+    //! | 基础契约 | happy path / 边界 | `publish_without_subscribers_is_noop` / `subscribe_then_publish_delivers` / `empty_figis_yields_closed_subscription` |
+    //! | fan-in 合流 | Subscription 的核心非平凡逻辑 | `multi_figi_fan_in_merges_streams` |
+    //! | I2 隔离 | 慢/断的订阅者不影响其他 | `slow_consumer_isolation` / `disconnected_subscriber_does_not_stall_others` |
+    //! | `dropped_total` 累积值 | GUIDELINE §4.3.3 累积值而非 delta | `dropped_total_is_cumulative_not_delta` |
+    //! | 订阅语义 | from-now / sender 生命周期 | `messages_before_subscribe_are_not_replayed` / `senders_entry_persists_after_all_subscribers_dropped` |
+    //!
+    //! # 关键设计取舍
+    //!
+    //! - **publisher 走 `sleep` 间隔而非 tight loop**:tight loop 会瞬间填爆
+    //!   broadcast ring(`cap=8`)→ 连 fast 也 lag → 失去"快/慢"对比意义。
+    //!   I2 测试用 10ms/笔节奏稳定区分 fast(无 sleep)与 slow(50ms/笔)。
+    //! - **deadline + `timeout(per-poll)` 而非 `sleep(constant)`**:CI 上 tokio
+    //!   启动 + std::thread 启动 + condvar wakeup 抖动可达 ±50ms,固定 sleep 易
+    //!   flake。主动 poll 是"达标即返回 + 兜底超时"的双赢。
+    //! - **多 FIGI fan-in 顺序不保证**:N 个并发 fan_in_one task 抢 mpsc::Sender,
+    //!   到达顺序与 tokio 调度相关。assert 用 sort + multiset 比对,不比对到达
+    //!   顺序。
+    //! - **B3 议题**(senders entry 不随订阅者退订自动清空)用
+    //!   `senders_entry_persists_after_all_subscribers_dropped` 固化当前行为,
+    //!   未来若决定改为收缩 entry,该测试即明确的回归告警点。详见 DEV_PROCESS §6.4。
+
     use super::*;
+    use std::time::Duration;
+
+    // -----------------------------------------------------------------------
+    // helpers
+    // -----------------------------------------------------------------------
 
     fn figi(s: &str) -> Figi {
         s.parse().unwrap()
@@ -191,6 +250,10 @@ mod tests {
         m.gateway_seq = seq;
         m
     }
+
+    // -----------------------------------------------------------------------
+    // 分区 1:基础契约(happy path / 边界)
+    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn publish_without_subscribers_is_noop() {
@@ -224,6 +287,68 @@ mod tests {
         assert!(sub.next().await.is_none());
     }
 
+    // -----------------------------------------------------------------------
+    // 分区 2:fan-in 合流(Subscription 的核心非平凡逻辑)
+    // -----------------------------------------------------------------------
+
+    /// **C1**:`Subscription` 的核心职责是把 N 条 broadcast::Receiver 合并成
+    /// 一条 mpsc::Receiver。订阅 `[a, b]`,a/b 各 publish 一笔,sub.next() 必须
+    /// 能各收到一笔且 figi 正确。
+    ///
+    /// # 顺序为何不能 assert
+    ///
+    /// 两条 fan_in_one task 并发跑 → 各自从独立 broadcast::Receiver pull →
+    /// 抢同一个 mpsc::Sender 的写入位。到达 mpsc 的顺序与 tokio 调度相关,
+    /// 与 publish 顺序无关。assert 走 multiset 比对(sort 后 ==)。
+    ///
+    /// # 守的不变量
+    ///
+    /// - **fan-in 合流正确性**:N 条流的并集 = sub 收到的集合(不漏)。
+    /// - **每条 broadcast 独立**:a 的 publish 不会让 b 的 fan_in_one 漏掉。
+    /// - **`dropped_total = 0`**:无任何丢失,排除"靠丢覆盖问题"的假阳性。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn multi_figi_fan_in_merges_streams() {
+        let bus = Arc::new(Bus::new(16));
+        let fa = figi("BBG000000001");
+        let fb = figi("BBG000000002");
+
+        let mut sub = bus.subscribe(&[fa, fb], 16);
+
+        // 等 2 个 fan_in_one task 完成 broadcast::Sender::subscribe 并跑到
+        // recv().await。这一步必要 —— subscribe 在 spawn 时刻才注册 receiver,
+        // 若没等就 publish,broadcast::Sender 看不到 receiver,消息直接丢。
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        bus.publish(book(11, fa));
+        bus.publish(book(22, fb));
+        bus.publish(book(33, fa));
+
+        let mut got: Vec<(u64, Figi)> = Vec::new();
+        for _ in 0..3 {
+            let b = tokio::time::timeout(Duration::from_millis(500), sub.next())
+                .await
+                .expect("timeout: fan-in 合流 3 笔超时")
+                .expect("subscription closed");
+            got.push((b.gateway_seq, b.figi));
+        }
+        got.sort_by_key(|t| t.0);
+
+        assert_eq!(
+            got,
+            vec![(11, fa), (22, fb), (33, fa)],
+            "multiset 必须 = 三笔 publish 的集合(顺序不限)"
+        );
+        assert_eq!(
+            sub.dropped_total(),
+            0,
+            "正常路径无任何丢失(排除靠丢遮盖问题的假阳性)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 分区 3:I2 隔离(慢/断的订阅者不影响其他)
+    // -----------------------------------------------------------------------
+
     /// **T1-unit（DEV_PROCESS §5.1）**：守 I2 "慢/斷的訂閱者不影響其他訂閱者"。
     ///
     /// 在 Bus 层（不走 gRPC）直接证明：两个 subscription 订阅同一个 FIGI，
@@ -239,7 +364,6 @@ mod tests {
     /// 自然把"快/慢"区分出来。
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn slow_consumer_isolation() {
-        use std::time::Duration;
         let bus = Arc::new(Bus::new(8));
         let f = figi("BBG000000001");
 
@@ -320,13 +444,72 @@ mod tests {
         );
     }
 
+    /// **C2**:守 I2 "**斷**的訂閱者不影響其他訂閱者"。
+    ///
+    /// `slow_consumer_isolation` 验证"慢"的隔离;本测试单独验证"断"的隔离 ——
+    /// 即一个订阅者被主动 `drop` 后,另一个订阅者仍正常收到全部更新且
+    /// `dropped_total = 0`。这是 DEV_PROCESS §5.4 「未做但已记录」的项,Phase 4
+    /// 补齐。
+    ///
+    /// # 断订阅者的生命周期
+    ///
+    /// 1. `drop(_to_drop)` → `Subscription` drop → 内部 `mpsc::Receiver` drop。
+    /// 2. 该订阅者对应的 `fan_in_one` task **仍在 `broadcast::Receiver::recv().await`**
+    ///    上挂着,**直到下一笔 publish 唤醒它** → `try_send` 返 `Closed` → task return。
+    /// 3. 之后该订阅者对应的 `broadcast::Sender` 仍持有(senders 表不缩,B3 议题),
+    ///    但其 receiver_count 减 1,后续 publish 走该 sender 仍 OK,只是少推一份。
+    ///
+    /// # 断言重点
+    ///
+    /// - `survivor` 收到全部 3 笔(不漏)。
+    /// - `survivor.dropped_total() == 0`(不被另一条退订路径污染)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn disconnected_subscriber_does_not_stall_others() {
+        let bus = Arc::new(Bus::new(16));
+        let f = figi("BBG000000001");
+
+        let mut survivor = bus.subscribe(&[f], 16);
+        let to_drop = bus.subscribe(&[f], 16);
+
+        // 等两个 fan_in_one task 都跑到 recv().await。
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // 主动断掉一个订阅者。注意:此刻被断者的 fan_in_one task 还在 await,
+        // 直到下一笔 publish 才会真正退出 —— 本测试只关心"是否影响 survivor"。
+        drop(to_drop);
+
+        bus.publish(book(1, f));
+        bus.publish(book(2, f));
+        bus.publish(book(3, f));
+
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            let b = tokio::time::timeout(Duration::from_millis(500), survivor.next())
+                .await
+                .expect("timeout: survivor 漏收")
+                .expect("survivor subscription closed");
+            got.push(b.gateway_seq);
+        }
+
+        assert_eq!(got, vec![1, 2, 3], "survivor 必须按序收到全部三笔");
+        assert_eq!(
+            survivor.dropped_total(),
+            0,
+            "I2:断开 sibling 订阅者不应让 survivor 出现任何丢失,实际 {}",
+            survivor.dropped_total()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 分区 4:dropped_total 累积值(GUIDELINE §4.3.3)
+    // -----------------------------------------------------------------------
+
     /// **T6（DEV_PROCESS §5.1 衍生）**：守 GUIDELINE §4.3.3 "累积值而非 delta"。
     ///
     /// `dropped_counter` 暴露 `Arc<AtomicU64>`，本测试验证两次连续观察之间
     /// 该值**只增不减**——客户端用差分算 lag 时只能依赖累积值。
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn dropped_total_is_cumulative_not_delta() {
-        use std::time::Duration;
         let bus = Arc::new(Bus::new(4));
         let f = figi("BBG000000001");
 
@@ -363,5 +546,118 @@ mod tests {
             snap3 > snap2,
             "再发一批后累积值应再涨：snap2={snap2} snap3={snap3}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 分区 5:订阅语义(from-now / sender 生命周期)
+    // -----------------------------------------------------------------------
+
+    /// **C3**:固化 GUIDELINE §3.2 / DEV_PROCESS §3.2 拍板的 **from-now 语义** ——
+    /// `Bus::publish` 走 get-only 路径,无订阅者时根本不创 broadcast::Sender,
+    /// 所以订阅前 publish 的消息既不入 ring buffer 也不持久化。
+    ///
+    /// # 设计取舍
+    ///
+    /// 这是显式的"无 history / 无 replay"决策(详见待问清单 Q11):
+    /// - 优点:零状态 → ingest hot path 无 history buffer → 守 I1。
+    /// - 取舍:client 想要订阅起点的最新一笔,必须在 subscribe 前 / 后自己
+    ///   先调用 `GetSnapshot`(README §3 的 R/R API)。
+    ///
+    /// # 守的契约
+    ///
+    /// - 订阅前 publish 的 seq=1, 2 **不**会出现在 sub.next() 中。
+    /// - 订阅后 publish 的 seq=99 **必**收到。
+    /// - 第二次 `next()` 必须 timeout(没有任何 replay)。
+    #[tokio::test]
+    async fn messages_before_subscribe_are_not_replayed() {
+        let bus = Arc::new(Bus::new(16));
+        let f = figi("BBG000000001");
+
+        // 无订阅者时 publish → senders.get(&f) = None → 直接 return,
+        // 既不创 broadcast::Sender 也不缓存消息。
+        bus.publish(book(1, f));
+        bus.publish(book(2, f));
+
+        let mut sub = bus.subscribe(&[f], 16);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // 订阅后才 publish 的这笔必须能收到。
+        bus.publish(book(99, f));
+
+        let got = tokio::time::timeout(Duration::from_millis(500), sub.next())
+            .await
+            .expect("timeout: 订阅后的 publish 应能收到")
+            .expect("subscription closed");
+        assert_eq!(
+            got.gateway_seq, 99,
+            "from-now 语义:首笔必须是订阅后 publish 的 seq=99(订阅前的 1, 2 不应补发)"
+        );
+
+        // 第二次 next 应当 timeout —— 没有 seq=1, 2 的回放。
+        let extra = tokio::time::timeout(Duration::from_millis(100), sub.next()).await;
+        assert!(
+            extra.is_err(),
+            "from-now 语义:订阅前的 publish 不应进入流,实际拿到 {extra:?}"
+        );
+    }
+
+    /// **C4 / B3 议题固化**:**senders 表 entry 不随订阅者退订自动清空**。
+    ///
+    /// 当前实现:`Bus::subscribe` 在 entry 缺失时 `or_insert_with` 创 sender,
+    /// 但**没有任何路径**在订阅者全退订后从 `senders` 移除 entry。长跑下若
+    /// 持续有 unique FIGI 进出,`senders` 大小**单调递增**,内存不回收。
+    ///
+    /// # 为什么把当前行为固化成测试
+    ///
+    /// 1. **明确告警点**:未来若有人为 B3 加 entry 收缩(例如 `Bus::publish` 检测
+    ///    `tx.receiver_count() == 0` 时移除 entry),本测试 fail,reviewer 立即
+    ///    知道行为变更,有意识地走文档更新流程。
+    /// 2. **交付素材**:Phase 4 README 在「Future work」或「设计取舍」段引用,
+    ///    展示"已知问题 + 量化边界 + 故意留待 trade-off"的工程成熟度。
+    ///
+    /// # 边界与缓解
+    ///
+    /// - 量纲:每 entry 是 `(Figi 12B + broadcast::Sender, 约几十 B)` × 数百万
+    ///   unique FIGI 才有意义。真实交易所 FIGI 数 < 100k,3 天 deliverable 不
+    ///   构成瓶颈。
+    /// - 缓解候选(若未来真撞墙):
+    ///   - 周期性 GC task 扫 `senders` 把 `receiver_count == 0` 的 entry 移除。
+    ///   - 在 `fan_in_one` 退出最后一个 receiver 时主动 `senders.remove(&figi)`,
+    ///     但需要回带 figi 参数 → 改 fan_in_one 签名。
+    ///
+    /// 详见待问清单 B3 / DEV_PROCESS §6.4。
+    #[tokio::test]
+    async fn senders_entry_persists_after_all_subscribers_dropped() {
+        let bus = Bus::new(16);
+        let f = figi("BBG000000001");
+
+        assert_eq!(bus.senders.len(), 0, "起始无 entry");
+
+        {
+            let _sub = bus.subscribe(&[f], 16);
+            assert_eq!(
+                bus.senders.len(),
+                1,
+                "subscribe 触发 or_insert_with → entry=1"
+            );
+        }
+        // _sub 离开作用域 → mpsc::Receiver drop → 但 fan_in_one task 仍在
+        // broadcast::recv().await 上挂着。
+
+        // 触发一笔 publish 让 fan_in_one 走到 try_send(Closed) 分支并退出。
+        bus.publish(book(1, f));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // ★ B3 行为固化:即使 fan_in_one 已退出、broadcast 已无 receiver,
+        // senders 中的 entry **不会**被自动清除。
+        assert_eq!(
+            bus.senders.len(),
+            1,
+            "B3:订阅者全退订后 entry 不缩 → 长跑下 unique FIGI 数 = senders 大小"
+        );
+
+        // 再 publish 一笔验证 noop(get-only 路径,SendError 被 `let _ =` 吞掉)。
+        bus.publish(book(2, f));
+        assert_eq!(bus.senders.len(), 1, "publish 不创新 entry 也不删旧 entry");
     }
 }
