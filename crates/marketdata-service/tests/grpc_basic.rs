@@ -6,6 +6,7 @@ mod common;
 
 use std::time::Duration;
 
+use marketdata_service::BoxError;
 use marketdata_service::make_book;
 use marketdata_service::pb::{GetSnapshotRequest, SubscribeRequest, snapshot_response::Result as SnapResult};
 use tokio_stream::StreamExt;
@@ -15,7 +16,7 @@ use tokio_stream::StreamExt;
 /// 启动 service 后 **不推任何数据**，立刻 GetSnapshot → 必须返 `NotYet`。
 /// 然后推一笔 → 再 GetSnapshot → 必须返 `Found` 且 seq 匹配。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn not_yet_then_found() -> anyhow::Result<()> {
+async fn not_yet_then_found() -> Result<(), BoxError> {
     let (running, mock) = common::spawn_default_service().await?;
     let mut client = common::make_client(running.addr()).await?;
 
@@ -58,7 +59,7 @@ async fn not_yet_then_found() -> anyhow::Result<()> {
 /// 守 README §2 "per-instrument latest-book snapshot"：
 /// 同 FIGI 连续推多笔递增 seq 后，GetSnapshot 必须返回**最大** seq。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn snapshot_returns_latest_seq() -> anyhow::Result<()> {
+async fn snapshot_returns_latest_seq() -> Result<(), BoxError> {
     let (running, mock) = common::spawn_default_service().await?;
     let mut client = common::make_client(running.addr()).await?;
 
@@ -87,7 +88,7 @@ async fn snapshot_returns_latest_seq() -> anyhow::Result<()> {
 
 /// 守 Subscribe 路径：订阅后推数据，client 应该收到一笔含正确 seq 的 BookUpdate。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn subscribe_streams_pushed_updates() -> anyhow::Result<()> {
+async fn subscribe_streams_pushed_updates() -> Result<(), BoxError> {
     let (running, mock) = common::spawn_default_service().await?;
     let mut client = common::make_client(running.addr()).await?;
 
@@ -105,7 +106,7 @@ async fn subscribe_streams_pushed_updates() -> anyhow::Result<()> {
 
     let upd = tokio::time::timeout(Duration::from_millis(500), stream.next())
         .await?
-        .ok_or_else(|| anyhow::anyhow!("stream closed without item"))??;
+        .ok_or_else(|| -> BoxError { "stream closed without item".into() })??;
     let book = upd.book.expect("BookUpdate.book required");
     assert_eq!(book.gateway_seq, 7);
     assert_eq!(book.figi, "BBG000000001");
@@ -119,7 +120,7 @@ async fn subscribe_streams_pushed_updates() -> anyhow::Result<()> {
 
 /// Subscribe 空 FIGI 列表必须返回 `InvalidArgument`（grpc.rs 内显式 check）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn subscribe_empty_figis_rejected() -> anyhow::Result<()> {
+async fn subscribe_empty_figis_rejected() -> Result<(), BoxError> {
     let (running, mock) = common::spawn_default_service().await?;
     let mut client = common::make_client(running.addr()).await?;
 

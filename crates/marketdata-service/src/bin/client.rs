@@ -27,13 +27,14 @@
 
 use std::time::{Duration, Instant};
 
+use marketdata_service::BoxError;
 use marketdata_service::pb::{
     GetSnapshotRequest, SubscribeRequest, market_data_client::MarketDataClient,
     snapshot_response::Result as SnapResult,
 };
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<(), BoxError> {
     let target = std::env::var("MDS_CLIENT_TARGET")
         .unwrap_or_else(|_| "http://127.0.0.1:50051".to_string());
     let figi = std::env::var("MDS_CLIENT_FIGI").unwrap_or_else(|_| "BBG000000001".to_string());
@@ -109,7 +110,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             Ok(Some(Err(status))) => {
-                anyhow::bail!("stream error: {status:?}");
+                return Err(format!("stream error: {status:?}").into());
             }
             Ok(None) => {
                 eprintln!("[client] stream closed by server");

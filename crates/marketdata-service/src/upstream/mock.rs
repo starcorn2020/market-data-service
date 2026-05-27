@@ -29,6 +29,8 @@ use std::time::Duration;
 
 use marketdata_types::BookMessage;
 
+use crate::BoxError;
+
 use super::Upstream;
 
 // ---------------------------------------------------------------------------
@@ -85,7 +87,7 @@ impl MockUpstream {
 }
 
 impl Upstream for MockUpstream {
-    fn receive(&self) -> anyhow::Result<Option<BookMessage>> {
+    fn receive(&self) -> Result<Option<BookMessage>, BoxError> {
         Ok(self.inner.queue.lock().unwrap().pop_front())
     }
 

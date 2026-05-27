@@ -19,6 +19,8 @@ use std::time::Duration;
 
 use feed_sim::{Pacing, SubscriberConfig};
 
+use crate::BoxError;
+
 // ---------------------------------------------------------------------------
 // UpstreamConfig
 // ---------------------------------------------------------------------------
@@ -151,7 +153,7 @@ impl ServiceConfig {
     /// | `MDS_SUBSCRIBER_QUEUE` | `subscriber_queue_size` | 1024 |
     /// | `MDS_PROGRESS_EVERY` | `progress_log_every` | 100 |
     /// | `MDS_LISTEN` | `listen_addr` | `0.0.0.0:50051` |
-    pub fn from_env() -> anyhow::Result<Self> {
+    pub fn from_env() -> Result<Self, BoxError> {
         let mut cfg = Self::default();
         let u = &mut cfg.upstream;
 
@@ -195,7 +197,7 @@ impl ServiceConfig {
         if let Ok(s) = std::env::var("MDS_LISTEN") {
             cfg.listen_addr = s
                 .parse()
-                .map_err(|e| anyhow::anyhow!("invalid MDS_LISTEN={s:?}: {e}"))?;
+                .map_err(|e| -> BoxError { format!("invalid MDS_LISTEN={s:?}: {e}").into() })?;
         }
 
         cfg.validate()?;
@@ -203,15 +205,15 @@ impl ServiceConfig {
     }
 
     /// 校验本层不变量。feed-sim 自己也会再校验一次（fail-fast 两道防线）。
-    pub fn validate(&self) -> anyhow::Result<()> {
+    pub fn validate(&self) -> Result<(), BoxError> {
         if self.bus_channel_capacity == 0 {
-            anyhow::bail!("bus_channel_capacity must be > 0");
+            return Err("bus_channel_capacity must be > 0".into());
         }
         if self.subscriber_queue_size == 0 {
-            anyhow::bail!("subscriber_queue_size must be > 0");
+            return Err("subscriber_queue_size must be > 0".into());
         }
         if self.poll_interval.is_zero() {
-            anyhow::bail!("poll_interval must be > 0 (avoid busy-loop)");
+            return Err("poll_interval must be > 0 (avoid busy-loop)".into());
         }
         Ok(())
     }
@@ -221,7 +223,7 @@ impl ServiceConfig {
 // helpers
 // ---------------------------------------------------------------------------
 
-fn parse_env<T>(name: &str) -> anyhow::Result<Option<T>>
+fn parse_env<T>(name: &str) -> Result<Option<T>, BoxError>
 where
     T: FromStr,
     T::Err: std::fmt::Display,
@@ -231,23 +233,23 @@ where
         Ok(s) => s
             .parse::<T>()
             .map(Some)
-            .map_err(|e| anyhow::anyhow!("invalid {name}={s:?}: {e}")),
+            .map_err(|e| -> BoxError { format!("invalid {name}={s:?}: {e}").into() }),
     }
 }
 
 /// `steady` / `bursty:N`（与 feed-sim 的 SIM_PACING 兼容）。
-fn parse_pacing(s: &str) -> anyhow::Result<Option<u32>> {
+fn parse_pacing(s: &str) -> Result<Option<u32>, BoxError> {
     let s = s.trim();
     if s.eq_ignore_ascii_case("steady") {
         return Ok(None);
     }
     if let Some(n) = s.strip_prefix("bursty:") {
-        let burst_size = n
-            .parse::<u32>()
-            .map_err(|e| anyhow::anyhow!("invalid SIM_PACING bursty:N (got {n:?}): {e}"))?;
+        let burst_size = n.parse::<u32>().map_err(|e| -> BoxError {
+            format!("invalid SIM_PACING bursty:N (got {n:?}): {e}").into()
+        })?;
         return Ok(Some(burst_size));
     }
-    anyhow::bail!("SIM_PACING must be 'steady' or 'bursty:N' (got {s:?})")
+    Err(format!("SIM_PACING must be 'steady' or 'bursty:N' (got {s:?})").into())
 }
 
 #[cfg(test)]

@@ -32,11 +32,20 @@ pub use config::{ServiceConfig, UpstreamConfig};
 pub use grpc::pb;
 pub use upstream::{MockHandle, MockUpstream, Upstream, make_book};
 
+// ---------------------------------------------------------------------------
+// 错误别名
+// ---------------------------------------------------------------------------
+
+/// Service 层统一错误类型。
+///
+/// `Box<dyn Error + Send + Sync + 'static>` 是 `Send + Sync`，可跨 `tokio::spawn`
+/// 边界；同时 `?` 自动从任何实现 `Error + Send + Sync + 'static` 的具体错误转换，
+/// 替代 `anyhow::Error` 的 ergonomic 又不引入额外依赖。
+pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-
-use anyhow::Context;
 
 use crate::bus::Bus;
 use crate::grpc::{MarketDataServer, MarketDataService};
@@ -71,7 +80,7 @@ impl Service {
     /// 注意此函数会**立即启动 feed-sim 背景执行緒**（透过 [`FeedSimUpstream::new`]），
     /// 因此 [`Service::run`] 之前已经在累积数据；gRPC server 上线时 snapshot 表
     /// 通常已经热身完毕（消除 client 第一笔必然 NotYet 的窘境）。
-    pub fn new(cfg: ServiceConfig) -> anyhow::Result<Self> {
+    pub fn new(cfg: ServiceConfig) -> Result<Self, BoxError> {
         let upstream = FeedSimUpstream::new(cfg.upstream.clone())?;
         Self::new_with_upstream(cfg, upstream)
     }
@@ -87,7 +96,7 @@ impl Service {
     pub fn new_with_upstream<U: Upstream + 'static>(
         cfg: ServiceConfig,
         upstream: U,
-    ) -> anyhow::Result<Self> {
+    ) -> Result<Self, BoxError> {
         cfg.validate()?;
 
         let snapshot = Arc::new(Snapshot::new());
@@ -115,11 +124,11 @@ impl Service {
     /// 1. `Ctrl-C` → stop ingest + tonic `serve` 因 `shutdown_signal` 退出
     /// 2. tonic `serve` 自身报错（端口冲突等）→ stop ingest 后向上抛
     /// 3. Ingest 自然 EOF（上游 `SIM_MAX_MESSAGES` 跑完）→ 触发 graceful shutdown
-    pub async fn run(mut self) -> anyhow::Result<()> {
+    pub async fn run(mut self) -> Result<(), BoxError> {
         let ingest_handle = self
             .ingest
             .take()
-            .ok_or_else(|| anyhow::anyhow!("Service::run called twice"))?;
+            .ok_or_else(|| -> BoxError { "Service::run called twice".into() })?;
 
         // gRPC service：注入共享 snapshot / bus。
         let svc = MarketDataService::new(
@@ -150,7 +159,7 @@ impl Service {
             //         主动断 gRPC server，让 serve_fut 在下一个 yield 退出。
             join_res = ingest_join => {
                 let stats = join_res
-                    .map_err(|e| anyhow::anyhow!("ingest join task panicked: {e}"))?;
+                    .map_err(|e| -> BoxError { format!("ingest join task panicked: {e}").into() })?;
                 eprintln!(
                     "[service] ingest finished: received={} gaps={}",
                     stats.received, stats.gaps
@@ -163,7 +172,7 @@ impl Service {
             //              停掉 ingest，避免线程泄漏。
             serve_res = serve_fut => {
                 stop_token.store(true, std::sync::atomic::Ordering::Release);
-                serve_res.map_err(|e| anyhow::anyhow!("tonic serve failed: {e}"))?;
+                serve_res.map_err(|e| -> BoxError { format!("tonic serve failed: {e}").into() })?;
                 eprintln!("[server] shut down gracefully");
                 Ok(())
             }
@@ -184,16 +193,17 @@ impl Service {
     ///
     /// 支持 `listen_addr = 127.0.0.1:0`（OS 分配动态端口），用 [`RunningService::addr`]
     /// 拿实际监听端口。集成测试用此避免端口冲突。
-    pub async fn start(mut self) -> anyhow::Result<RunningService> {
-        let listener = tokio::net::TcpListener::bind(self.listen_addr)
+    pub async fn start(mut self) -> Result<RunningService, BoxError> {
+        let listen_addr = self.listen_addr;
+        let listener = tokio::net::TcpListener::bind(listen_addr)
             .await
-            .with_context(|| format!("bind tcp listener on {}", self.listen_addr))?;
+            .map_err(|e| -> BoxError { format!("bind tcp listener on {listen_addr}: {e}").into() })?;
         let local_addr = listener.local_addr()?;
 
         let ingest = self
             .ingest
             .take()
-            .ok_or_else(|| anyhow::anyhow!("Service::start called twice"))?;
+            .ok_or_else(|| -> BoxError { "Service::start called twice".into() })?;
         let stop_token = ingest.stop_token();
         let snapshot = self.snapshot.clone();
 
@@ -218,7 +228,7 @@ impl Service {
             stop_token.store(true, Ordering::Release);
             drop(ingest);
 
-            serve_res.map_err(|e| anyhow::anyhow!("tonic serve failed: {e}"))
+            serve_res.map_err(|e| -> BoxError { format!("tonic serve failed: {e}").into() })
         });
 
         Ok(RunningService {
@@ -243,7 +253,7 @@ impl Service {
 pub struct RunningService {
     local_addr: SocketAddr,
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    join: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
+    join: Option<tokio::task::JoinHandle<Result<(), BoxError>>>,
     snapshot: Arc<Snapshot>,
 }
 
@@ -259,13 +269,13 @@ impl RunningService {
     }
 
     /// 发送 shutdown 信号并 await server task 结束。
-    pub async fn shutdown(mut self) -> anyhow::Result<()> {
+    pub async fn shutdown(mut self) -> Result<(), BoxError> {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
         if let Some(join) = self.join.take() {
             join.await
-                .map_err(|e| anyhow::anyhow!("server task panicked: {e}"))?
+                .map_err(|e| -> BoxError { format!("server task panicked: {e}").into() })?
         } else {
             Ok(())
         }

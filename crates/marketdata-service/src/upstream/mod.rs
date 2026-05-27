@@ -23,6 +23,8 @@ use std::time::Duration;
 
 use marketdata_types::BookMessage;
 
+use crate::BoxError;
+
 mod feed_sim;
 mod mock;
 
@@ -39,7 +41,7 @@ pub use mock::{MockHandle, MockUpstream, make_book};
 /// - `&self` 即可调用，使用者通过 `move` 进 ingest 线程独占。
 pub trait Upstream: Send {
     /// 非阻塞拉一笔。`Ok(None)` = 当下 buffer 空；`Ok(Some(_))` = 拿到一笔。
-    fn receive(&self) -> anyhow::Result<Option<BookMessage>>;
+    fn receive(&self) -> Result<Option<BookMessage>, BoxError>;
 
     /// 阻塞 `duration` 后返回；`Err(())` = 上游已排空且关闭 = 唯一合法的结束信号。
     fn wait(&self, duration: Duration) -> Result<(), ()>;

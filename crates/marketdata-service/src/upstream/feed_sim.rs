@@ -4,10 +4,10 @@
 
 use std::time::Duration;
 
-use anyhow::Context;
 use feed_sim::{FeedSubscriber, SubscriberConfig};
 use marketdata_types::BookMessage;
 
+use crate::BoxError;
 use crate::config::UpstreamConfig;
 
 use super::Upstream;
@@ -23,23 +23,23 @@ pub struct FeedSimUpstream {
 
 impl FeedSimUpstream {
     /// 构造并立即启动上游背景执行緒。
-    pub fn new(cfg: UpstreamConfig) -> anyhow::Result<Self> {
+    pub fn new(cfg: UpstreamConfig) -> Result<Self, BoxError> {
         let sc: SubscriberConfig = cfg.into();
-        let inner = FeedSubscriber::new(sc)
-            .map_err(|e| anyhow::anyhow!("{e:?}"))
-            .context("feed-sim subscriber init failed")?;
+        let inner = FeedSubscriber::new(sc).map_err(|e| -> BoxError {
+            format!("feed-sim subscriber init failed: {e:?}").into()
+        })?;
         Ok(Self { inner })
     }
 }
 
 impl Upstream for FeedSimUpstream {
-    fn receive(&self) -> anyhow::Result<Option<BookMessage>> {
+    fn receive(&self) -> Result<Option<BookMessage>, BoxError> {
         match self.inner.receive() {
             // FeedSample 在此处 deref 然后值拷贝（408 bytes / Copy）。
             // 跨线程传递必须传值，引用会被 sample 生命周期绑住。
             Ok(Some(sample)) => Ok(Some(*sample)),
             Ok(None) => Ok(None),
-            Err(e) => Err(anyhow::anyhow!("feed-sim receive failed: {e:?}")),
+            Err(e) => Err(format!("feed-sim receive failed: {e:?}").into()),
         }
     }
 

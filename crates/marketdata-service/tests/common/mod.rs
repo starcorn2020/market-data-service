@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use marketdata_service::pb::market_data_client::MarketDataClient;
 use marketdata_service::{
-    MockHandle, MockUpstream, RunningService, Service, ServiceConfig, UpstreamConfig,
+    BoxError, MockHandle, MockUpstream, RunningService, Service, ServiceConfig, UpstreamConfig,
 };
 use tonic::transport::Channel;
 
@@ -39,7 +39,9 @@ pub fn test_config() -> ServiceConfig {
 /// - `running.addr()` 是实际监听地址（OS 分配）。
 /// - `mock_handle.push(book)` 注入消息；`mock_handle.close()` 让 ingest 自然结束。
 /// - 测试结束前**必须** `running.shutdown().await` 防止线程泄漏。
-pub async fn spawn_service(cfg: ServiceConfig) -> anyhow::Result<(RunningService, MockHandle)> {
+pub async fn spawn_service(
+    cfg: ServiceConfig,
+) -> Result<(RunningService, MockHandle), BoxError> {
     let (upstream, handle) = MockUpstream::new();
     let service = Service::new_with_upstream(cfg, upstream)?;
     let running = service.start().await?;
@@ -47,7 +49,7 @@ pub async fn spawn_service(cfg: ServiceConfig) -> anyhow::Result<(RunningService
 }
 
 /// 启动 + 用默认 config（适合大部分测试）。
-pub async fn spawn_default_service() -> anyhow::Result<(RunningService, MockHandle)> {
+pub async fn spawn_default_service() -> Result<(RunningService, MockHandle), BoxError> {
     spawn_service(test_config()).await
 }
 
@@ -55,7 +57,9 @@ pub async fn spawn_default_service() -> anyhow::Result<(RunningService, MockHand
 ///
 /// `tonic::transport::Channel::from_shared` 接受 `String` URL，
 /// 这里组装 `http://127.0.0.1:<port>`。
-pub async fn make_client(addr: std::net::SocketAddr) -> anyhow::Result<MarketDataClient<Channel>> {
+pub async fn make_client(
+    addr: std::net::SocketAddr,
+) -> Result<MarketDataClient<Channel>, BoxError> {
     let url = format!("http://{addr}");
     let channel = Channel::from_shared(url)?
         .connect_timeout(Duration::from_secs(2))
@@ -72,7 +76,7 @@ pub async fn wait_for_snapshot_len(
     running: &RunningService,
     target: usize,
     timeout: Duration,
-) -> anyhow::Result<()> {
+) -> Result<(), BoxError> {
     let deadline = tokio::time::Instant::now() + timeout;
     while tokio::time::Instant::now() < deadline {
         if running.snapshot_len() >= target {
@@ -80,9 +84,9 @@ pub async fn wait_for_snapshot_len(
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    anyhow::bail!(
-        "snapshot did not reach len={target} within {timeout:?} \
-         (actual={})",
+    Err(format!(
+        "snapshot did not reach len={target} within {timeout:?} (actual={})",
         running.snapshot_len()
     )
+    .into())
 }

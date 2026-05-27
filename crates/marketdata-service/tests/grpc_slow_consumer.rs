@@ -11,12 +11,13 @@ mod common;
 
 use std::time::Duration;
 
+use marketdata_service::BoxError;
 use marketdata_service::make_book;
 use marketdata_service::pb::SubscribeRequest;
 use tokio_stream::StreamExt;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn slow_consumer_isolation_e2e() -> anyhow::Result<()> {
+async fn slow_consumer_isolation_e2e() -> Result<(), BoxError> {
     // 故意把 wire 端 mpsc 队列压小，让慢 client 更易触发 Full。
     let mut cfg = common::test_config();
     cfg.bus_channel_capacity = 16;

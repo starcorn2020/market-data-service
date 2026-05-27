@@ -13,10 +13,10 @@
 //! - 最后看到 `[ingest] stopped: received=1000 ...`
 //! - 进程退出码 0
 
-use marketdata_service::{Service, ServiceConfig};
+use marketdata_service::{BoxError, Service, ServiceConfig};
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<(), BoxError> {
     let cfg = ServiceConfig::from_env()?;
     eprintln!("[main] config: {cfg:#?}");
 
